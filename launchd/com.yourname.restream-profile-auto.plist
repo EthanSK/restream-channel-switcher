@@ -4,11 +4,11 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.ethansk.restream-profile-auto</string>
+    <string>com.yourname.restream-profile-auto</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/ethansarif-kattan/Projects/restream-profile-switcher/native/usb-watcher/usb-watcher</string>
+        <string>/Users/YOUR_USERNAME/Projects/restream-profile-switcher/native/usb-watcher/usb-watcher</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -21,10 +21,10 @@
     <integer>5</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/ethansarif-kattan/Library/Logs/restream-profile-auto.log</string>
+    <string>/Users/YOUR_USERNAME/Library/Logs/restream-profile-auto.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/ethansarif-kattan/Library/Logs/restream-profile-auto.log</string>
+    <string>/Users/YOUR_USERNAME/Library/Logs/restream-profile-auto.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>

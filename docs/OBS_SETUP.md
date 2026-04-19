@@ -68,7 +68,7 @@ This produces `./usb-watcher`. It reads its config from
 
 ```json
 {
-  "restream_profile_cli": "/Users/ethansarif-kattan/Projects/restream-profile-switcher/restream-profile.py",
+  "restream_profile_cli": "$HOME/Projects/restream-profile-switcher/restream-profile.py",
   "triggers": [
     {
       "on": "usb_attach",
@@ -91,8 +91,8 @@ See "USB device matcher" section below for how to fill in the IDs.
 ### 2. Install the LaunchAgent
 
 ```bash
-cp launchd/com.ethansk.restream-profile-auto.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.ethansk.restream-profile-auto.plist
+cp launchd/com.yourname.restream-profile-auto.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.yourname.restream-profile-auto.plist
 ```
 
 The agent:
@@ -107,8 +107,8 @@ Restream destinations update to match.
 
 ```bash
 pip3 install --user obsws-python
-cp launchd/com.ethansk.obs-profile-listener.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.ethansk.obs-profile-listener.plist
+cp launchd/com.yourname.obs-profile-listener.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.yourname.obs-profile-listener.plist
 ```
 
 The listener:
@@ -121,7 +121,7 @@ The listener:
 ### 4. Verify
 
 ```bash
-launchctl list | grep ethansk
+launchctl list | grep yourname
 tail -f ~/Library/Logs/restream-profile-auto.log
 tail -f ~/Library/Logs/obs-profile-listener.log
 ```
@@ -193,7 +193,7 @@ tail -f ~/Library/Logs/restream-profile-auto.log
 tail -f ~/Library/Logs/obs-profile-listener.log
 
 # Launchd stdout/stderr (if plist misconfigured)
-log stream --predicate 'subsystem == "com.apple.xpc.launchd"' --info | grep ethansk
+log stream --predicate 'subsystem == "com.apple.xpc.launchd"' --info | grep yourname
 ```
 
 ### Check obs-websocket is reachable
@@ -217,10 +217,10 @@ In OBS: Profile menu → pick the other profile. The listener should log
 ### Reload the LaunchAgents after editing
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.ethansk.restream-profile-auto.plist
-launchctl load   ~/Library/LaunchAgents/com.ethansk.restream-profile-auto.plist
-launchctl unload ~/Library/LaunchAgents/com.ethansk.obs-profile-listener.plist
-launchctl load   ~/Library/LaunchAgents/com.ethansk.obs-profile-listener.plist
+launchctl unload ~/Library/LaunchAgents/com.yourname.restream-profile-auto.plist
+launchctl load   ~/Library/LaunchAgents/com.yourname.restream-profile-auto.plist
+launchctl unload ~/Library/LaunchAgents/com.yourname.obs-profile-listener.plist
+launchctl load   ~/Library/LaunchAgents/com.yourname.obs-profile-listener.plist
 ```
 
 ---
