@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
 # restream-channel-switch — toggle Restream streaming destinations on/off
-# based on user-defined "flags" (labels) that map to sets of channels.
+# based on user-defined "aliases" (labels) that map to explicit sets of
+# channels by channel ID.
 #
-# Pure bash. Requires: curl, security (macOS), jq.
+# Pure bash. Requires: bash 3.2+, curl, jq, security (macOS), nc, openssl, open.
 #
 # Usage:
 #   restream-channel-switch --auth
 #   restream-channel-switch --setup
+#   restream-channel-switch --add-alias NAME
 #   restream-channel-switch --list
-#   restream-channel-switch --flags
-#   restream-channel-switch --flag wreathen [--dry-run]
-#   restream-channel-switch --enable "YouTube" --disable "Twitch"
+#   restream-channel-switch --aliases
+#   restream-channel-switch --alias NAME [--dry-run]
 #   restream-channel-switch --status
 #   restream-channel-switch --reset-creds
 #   restream-channel-switch --help
 #
-# Tokens + client credentials + flag map live in the macOS Keychain.
+# Tokens + client credentials + alias map live in the macOS Keychain.
 # Service name is "com.restream-profile" for continuity with older installs
 # (pre-rename). Do NOT change it — that would invalidate existing auth.
 # Refresh tokens rotate — we persist each new refresh_token back to the keychain.
@@ -39,7 +40,8 @@ KEYCHAIN_SERVICE="com.restream-profile"
 KC_ACCOUNT_TOKENS="tokens"
 KC_ACCOUNT_CLIENT="client"
 KC_ACCOUNT_STATE="last-state"
-KC_ACCOUNT_FLAGS="channel-flags"
+KC_ACCOUNT_ALIASES="channel-aliases"
+KC_ACCOUNT_ALIASES_LEGACY="channel-flags"
 
 AUTHORIZE_URL="https://api.restream.io/login"
 TOKEN_URL="https://api.restream.io/oauth/token"
@@ -53,7 +55,7 @@ LOG_DIR="${HOME}/Library/Logs/restream-channel-switch"
 LOG_FILE="${LOG_DIR}/toggle.log"
 LOG_MAX_BYTES=$((10 * 1024 * 1024))  # 10 MB
 
-USER_AGENT="restream-channel-switch/2.0 (+https://github.com/EthanSK/restream-channel-switcher)"
+USER_AGENT="restream-channel-switch/2.1 (+https://github.com/EthanSK/restream-channel-switcher)"
 
 EXIT_OK=0
 EXIT_AUTH=1
@@ -128,7 +130,23 @@ CLIENT_SECRET=""
 ACCESS_TOKEN=""
 REFRESH_TOKEN=""
 ACCESS_EXPIRES_AT=0
-FLAG_MAP_JSON=""
+ALIAS_MAP_JSON=""
+
+alias_map_is_valid() {
+  printf '%s' "$1" | jq -e '
+    type == "object"
+    and (.channel_aliases | type == "object")
+    and ((.channel_aliases // {}) | all(.[]; type == "array" and all(.[]; type == "string")))
+  ' >/dev/null 2>&1
+}
+
+legacy_alias_map_is_valid() {
+  printf '%s' "$1" | jq -e '
+    type == "object"
+    and (.channel_flags | type == "object")
+    and ((.channel_flags // {}) | all(.[]; type == "array" and all(.[]; type == "string")))
+  ' >/dev/null 2>&1
+}
 
 load_client_creds() {
   local raw
@@ -172,16 +190,48 @@ load_last_state() {
   kc_get "$KC_ACCOUNT_STATE"
 }
 
-load_flag_map() {
+# Load alias map. Schema:
+#   {"channel_aliases": {"<channel_id>": ["alias1", "alias2"], ...}}
+#
+# One-time migration: if the new key is missing but the legacy
+# "channel-flags" key exists with a "channel_flags" object, read it,
+# rename the wrapping key to "channel_aliases", save under the new
+# keychain account, and use it. Legacy entry is left in place (we don't
+# delete it) so a downgrade still works during the transition; --reset-creds
+# does clear both.
+load_alias_map() {
   local raw
-  raw=$(kc_get "$KC_ACCOUNT_FLAGS") || return 1
-  [[ -n "$raw" ]] || return 1
-  printf '%s' "$raw" | jq -e 'has("channel_flags")' >/dev/null 2>&1 || return 1
-  FLAG_MAP_JSON="$raw"
+  raw=$(kc_get "$KC_ACCOUNT_ALIASES" 2>/dev/null || true)
+  if [[ -n "$raw" ]]; then
+    if alias_map_is_valid "$raw"; then
+      ALIAS_MAP_JSON="$raw"
+      return 0
+    fi
+    echo "error: keychain entry '$KC_ACCOUNT_ALIASES' is not a valid alias map; refusing to overwrite it." >&2
+    return 2
+  fi
+
+  # Legacy fallback: read "channel-flags" → migrate to "channel-aliases".
+  local legacy
+  legacy=$(kc_get "$KC_ACCOUNT_ALIASES_LEGACY" 2>/dev/null || true)
+  if [[ -n "$legacy" ]] && legacy_alias_map_is_valid "$legacy"; then
+    local migrated
+    migrated=$(printf '%s' "$legacy" | jq -c '{channel_aliases: (.channel_flags // {})}') || return 1
+    if ! save_alias_map "$migrated"; then
+      echo "error: failed to save migrated alias map to keychain account '$KC_ACCOUNT_ALIASES'." >&2
+      return 2
+    fi
+    ALIAS_MAP_JSON="$migrated"
+    echo "(migrated legacy 'channel-flags' keychain entry → 'channel-aliases')" >&2
+    log_event action migrate from channel-flags to channel-aliases result ok
+    return 0
+  fi
+
+  return 1
 }
 
-save_flag_map() {
-  kc_set "$KC_ACCOUNT_FLAGS" "$1"
+save_alias_map() {
+  kc_set "$KC_ACCOUNT_ALIASES" "$1"
 }
 
 # ---------------------------------------------------------------------------
@@ -219,6 +269,10 @@ CB_STATE=""
 CB_ERROR=""
 
 await_oauth_callback() {
+  # $1 = path of result file to write CB_CODE/CB_STATE/CB_ERROR into.
+  # Required because this function is invoked via `&`, which puts it in a
+  # subshell — globals set here would not propagate to the parent.
+  local result_file="$1"
   local tmp
   tmp=$(mktemp -t restream-cb.XXXXXX)
   trap 'rm -f "$tmp"' RETURN
@@ -250,6 +304,9 @@ await_oauth_callback() {
       esac
     done
   done
+
+  printf 'CB_CODE=%q\nCB_STATE=%q\nCB_ERROR=%q\n' \
+    "$CB_CODE" "$CB_STATE" "$CB_ERROR" > "$result_file"
 }
 
 do_auth_flow() {
@@ -272,7 +329,11 @@ do_auth_flow() {
   echo "  $auth_url"
   echo
 
-  await_oauth_callback &
+  local cb_result
+  cb_result=$(mktemp -t restream-cb-result.XXXXXX)
+  trap 'rm -f "$cb_result"' RETURN
+
+  await_oauth_callback "$cb_result" &
   local cb_pid=$!
   sleep 0.3
   open "$auth_url" 2>/dev/null || true
@@ -289,6 +350,13 @@ do_auth_flow() {
   done
   wait "$cb_pid" 2>/dev/null || true
 
+  # Pull captured values from the result file (the subshell can't write to
+  # parent globals via `func &`, so we round-trip through a temp file).
+  if [[ -s "$cb_result" ]]; then
+    # shellcheck disable=SC1090
+    source "$cb_result"
+  fi
+
   if [[ -n "$CB_ERROR" ]]; then
     echo "OAuth error: $CB_ERROR" >&2
     exit "$EXIT_AUTH"
@@ -304,7 +372,7 @@ do_auth_flow() {
 
   exchange_code_for_tokens "$CB_CODE"
   echo "Tokens saved to Keychain."
-  echo "Next: run '--setup' to map your channels to flags."
+  echo "Next: run '--setup' to map your channels to aliases."
   log_event action auth result ok
 }
 
@@ -431,36 +499,8 @@ fetch_profile() {
 }
 
 # ---------------------------------------------------------------------------
-# Channel lookup helpers
+# Toggle application
 # ---------------------------------------------------------------------------
-find_channel_by_name() {
-  local json="$1" name="$2"
-  local needle
-  needle=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
-  local exact
-  exact=$(printf '%s' "$json" | jq --arg n "$needle" \
-    '[.[] | select((.displayName // "" | ascii_downcase) == $n)]')
-  local count
-  count=$(printf '%s' "$exact" | jq 'length')
-  if (( count >= 1 )); then
-    printf '%s' "$exact" | jq '.[0]'
-    return 0
-  fi
-  local subs
-  subs=$(printf '%s' "$json" | jq --arg n "$needle" \
-    '[.[] | select((.displayName // "" | ascii_downcase) | contains($n))]')
-  count=$(printf '%s' "$subs" | jq 'length')
-  if (( count == 1 )); then
-    printf '%s' "$subs" | jq '.[0]'
-    return 0
-  fi
-  if (( count > 1 )); then
-    echo "Ambiguous channel name '$name' -- matches $(printf '%s' "$subs" | jq -c '[.[].displayName]')" >&2
-    return 2
-  fi
-  return 1
-}
-
 ENABLED_NAMES=()
 DISABLED_NAMES=()
 ERRORS_JSON="[]"
@@ -497,27 +537,31 @@ apply_toggles() {
 }
 
 # ---------------------------------------------------------------------------
-# Flag-map driven logic
+# Alias-driven logic
 # ---------------------------------------------------------------------------
 TO_ENABLE_JSON="[]"
 TO_DISABLE_JSON="[]"
 MATCH_COUNT=0
 
-compute_toggles_for_flag() {
-  local flag="$1" channels="$2" flagmap="$3"
+compute_toggles_for_alias() {
+  local alias_name="$1" channels="$2" alias_map="$3"
   local matched
-  matched=$(jq -cn --arg f "$flag" --argjson m "$flagmap" --argjson ch "$channels" '
-    ($m.channel_flags // {}) as $cf
+  matched=$(jq -cn --arg a "$alias_name" --argjson m "$alias_map" --argjson ch "$channels" '
+    ($m.channel_aliases // {}) as $ca
     | [$ch[] | select(
-        (($cf[(.id|tostring)] // []) | index($f)) != null
+        (($ca[(.id|tostring)] // []) | index($a)) != null
       )]
   ')
   MATCH_COUNT=$(printf '%s' "$matched" | jq 'length')
 
-  TO_ENABLE_JSON=$(printf '%s' "$matched" | jq '[.[] | select(.active | not)]')
+  TO_ENABLE_JSON=$(printf '%s' "$matched" | jq '
+    def live: if .enabled != null then .enabled elif .active != null then .active else false end;
+    [.[] | select((live | not))]
+  ')
   TO_DISABLE_JSON=$(jq -cn --argjson all "$channels" --argjson m "$matched" '
+    def live: if .enabled != null then .enabled elif .active != null then .active else false end;
     ($m | map(.id)) as $keep
-    | [$all[] | select(.active and ((.id as $id | $keep | index($id)) | not))]
+    | [$all[] | select(live and ((.id as $id | $keep | index($id)) | not))]
   ')
 }
 
@@ -528,73 +572,88 @@ cmd_list() {
   fetch_channels
   printf '%-6s %-12s %-14s %s\n' "STATE" "ID" "PLATFORM" "NAME"
   printf '%s' "$CHANNELS_JSON" \
-    | jq -r 'sort_by(.displayName // "" | ascii_downcase) | .[]
-      | [(if .active then "ON " else "off" end),
+    | jq -r 'def live: if .enabled != null then .enabled elif .active != null then .active else false end;
+      sort_by([(.streamingPlatformId // .platformId // "" | tostring),
+                     (.displayName // "" | ascii_downcase)]) | .[]
+      | [(if live then "ON " else "off" end),
          (.id // "" | tostring),
          ((.streamingPlatformId // .platformId // "") | tostring),
          (.displayName // "")] | @tsv' \
     | awk -F'\t' '{printf "%-6s %-12s %-14s %s\n", $1, $2, $3, $4}'
   local total active
   total=$(printf '%s' "$CHANNELS_JSON" | jq 'length')
-  active=$(printf '%s' "$CHANNELS_JSON" | jq '[.[] | select(.active)] | length')
+  active=$(printf '%s' "$CHANNELS_JSON" | jq '
+    def live: if .enabled != null then .enabled elif .active != null then .active else false end;
+    [.[] | select(live)] | length')
   printf '\n%d channel(s), %d active.\n' "$total" "$active"
 }
 
-cmd_flags() {
-  if ! load_flag_map; then
-    echo "No flag mapping yet. Run --setup to create one." >&2
+cmd_aliases() {
+  local load_rc
+  load_alias_map
+  load_rc=$?
+  if (( load_rc == 1 )); then
+    echo "No alias mapping yet. Run --setup to create one." >&2
     return "$EXIT_NO_SETUP"
+  elif (( load_rc != 0 )); then
+    return "$EXIT_NETWORK"
   fi
-  printf '%s' "$FLAG_MAP_JSON" | jq -r '
-    (.channel_flags // {})
+  printf '%s' "$ALIAS_MAP_JSON" | jq -r '
+    (.channel_aliases // {})
     | to_entries
-    | map(.value[])
+    | map((.value // []) | unique | .[])
     | group_by(.)
-    | map({flag: .[0], count: length})
-    | sort_by(.flag)
+    | map({alias: .[0], count: length})
+    | sort_by(.alias)
     | (if length == 0 then
-        "(no flags defined yet)"
+        "(no aliases defined yet)"
        else
-        (["FLAG","CHANNELS"] | @tsv),
-        (.[] | [.flag, (.count|tostring)] | @tsv)
+        (["ALIAS","CHANNELS"] | @tsv),
+        (.[] | [.alias, (.count|tostring)] | @tsv)
        end)
   ' | awk -F'\t' '{printf "%-24s %s\n", $1, $2}'
 }
 
-cmd_flag() {
-  local flag="$1" dry="$2"
-  if ! load_flag_map; then
+cmd_alias() {
+  local alias_name="$1" dry="$2"
+  local load_rc
+  load_alias_map
+  load_rc=$?
+  if (( load_rc == 1 )); then
     cat >&2 <<EOF
-No flag mapping found. Run '--setup' first to choose which channels
-belong to which flags. For example:
+No alias mapping found. Run '--setup' first to choose which channels
+belong to which aliases. For example:
 
   restream-channel-switch --setup
-  restream-channel-switch --flag $flag
+  restream-channel-switch --alias $alias_name
 EOF
-    log_event action flag flag "$flag" result no-setup
+    log_event action alias alias "$alias_name" result no-setup
     return "$EXIT_NO_SETUP"
+  elif (( load_rc != 0 )); then
+    log_event action alias alias "$alias_name" result invalid-alias-map
+    return "$EXIT_NETWORK"
   fi
   fetch_channels
 
-  compute_toggles_for_flag "$flag" "$CHANNELS_JSON" "$FLAG_MAP_JSON"
+  compute_toggles_for_alias "$alias_name" "$CHANNELS_JSON" "$ALIAS_MAP_JSON"
 
   if (( MATCH_COUNT == 0 )); then
-    echo "No channels are assigned to flag '$flag'." >&2
-    echo "Run --setup to assign channels, or --flags to list defined flags." >&2
-    log_event action flag flag "$flag" result no-match
+    echo "No channels are assigned to alias '$alias_name'." >&2
+    echo "Run --setup to assign channels, or --aliases to list defined aliases." >&2
+    log_event action alias alias "$alias_name" result no-match
     return "$EXIT_NO_MATCH"
   fi
 
   local en_count dis_count matched_names
-  matched_names=$(jq -cn --arg f "$flag" --argjson m "$FLAG_MAP_JSON" --argjson ch "$CHANNELS_JSON" '
-    ($m.channel_flags // {}) as $cf
-    | [$ch[] | select((($cf[(.id|tostring)] // []) | index($f)) != null) | .displayName]
+  matched_names=$(jq -cn --arg a "$alias_name" --argjson m "$ALIAS_MAP_JSON" --argjson ch "$CHANNELS_JSON" '
+    ($m.channel_aliases // {}) as $ca
+    | [$ch[] | select((($ca[(.id|tostring)] // []) | index($a)) != null) | .displayName]
   ')
   en_count=$(printf '%s' "$TO_ENABLE_JSON" | jq 'length')
   dis_count=$(printf '%s' "$TO_DISABLE_JSON" | jq 'length')
 
-  echo "Flag '$flag':"
-  echo "  channels in flag ($MATCH_COUNT): $matched_names"
+  echo "Alias '$alias_name':"
+  echo "  channels in alias ($MATCH_COUNT): $matched_names"
   echo "  will enable  ($en_count): $(printf '%s' "$TO_ENABLE_JSON" | jq -c '[.[].displayName]')"
   echo "  will disable ($dis_count): $(printf '%s' "$TO_DISABLE_JSON" | jq -c '[.[].displayName]')"
 
@@ -608,18 +667,18 @@ EOF
   local ts state_json
   ts=$(date "+%Y-%m-%dT%H:%M:%S%z")
   state_json=$(jq -cn \
-    --arg flag "$flag" --arg ts "$ts" \
+    --arg alias "$alias_name" --arg ts "$ts" \
     --argjson enabled "$(printf '%s\n' "${ENABLED_NAMES[@]:-}" | jq -Rsc 'split("\n")|map(select(length>0))')" \
     --argjson disabled "$(printf '%s\n' "${DISABLED_NAMES[@]:-}" | jq -Rsc 'split("\n")|map(select(length>0))')" \
     --argjson errors "$ERRORS_JSON" \
-    '{flag:$flag, ts:$ts, enabled:$enabled, disabled:$disabled, errors:$errors}')
+    '{alias:$alias, ts:$ts, enabled:$enabled, disabled:$disabled, errors:$errors}')
   save_last_state "$state_json"
 
   local err_count
   err_count=$(printf '%s' "$ERRORS_JSON" | jq 'length')
   local result="ok"
   (( err_count > 0 )) && result="partial"
-  log_event action flag flag "$flag" result "$result" errors "$err_count"
+  log_event action alias alias "$alias_name" result "$result" errors "$err_count"
 
   if (( err_count > 0 )); then
     echo
@@ -627,53 +686,7 @@ EOF
     return "$EXIT_PARTIAL"
   fi
   echo
-  echo "Flag '$flag' applied."
-  return "$EXIT_OK"
-}
-
-cmd_enable_disable() {
-  fetch_channels
-
-  local to_enable='[]' to_disable='[]'
-  local name rc
-  while IFS= read -r name; do
-    [[ -z "$name" ]] && continue
-    local ch
-    ch=$(find_channel_by_name "$CHANNELS_JSON" "$name")
-    rc=$?
-    if (( rc == 1 )); then
-      echo "No channel matches '$name'" >&2
-      return "$EXIT_NO_MATCH"
-    elif (( rc == 2 )); then
-      return "$EXIT_NO_MATCH"
-    fi
-    to_enable=$(jq -cn --argjson a "$to_enable" --argjson c "$ch" '$a + [$c]')
-  done <<< "$1"
-
-  while IFS= read -r name; do
-    [[ -z "$name" ]] && continue
-    local ch
-    ch=$(find_channel_by_name "$CHANNELS_JSON" "$name")
-    rc=$?
-    if (( rc == 1 )); then
-      echo "No channel matches '$name'" >&2
-      return "$EXIT_NO_MATCH"
-    elif (( rc == 2 )); then
-      return "$EXIT_NO_MATCH"
-    fi
-    to_disable=$(jq -cn --argjson a "$to_disable" --argjson c "$ch" '$a + [$c]')
-  done <<< "$2"
-
-  apply_toggles "$to_enable" "$to_disable"
-
-  local err_count
-  err_count=$(printf '%s' "$ERRORS_JSON" | jq 'length')
-  local result="ok"
-  (( err_count > 0 )) && result="partial"
-  log_event action enable-disable result "$result" errors "$err_count"
-  if (( err_count > 0 )); then
-    return "$EXIT_PARTIAL"
-  fi
+  echo "Alias '$alias_name' applied."
   return "$EXIT_OK"
 }
 
@@ -685,13 +698,18 @@ cmd_status() {
     email=$(printf '%s' "$PROFILE_JSON" | jq -r '.email // empty')
     echo "User: $user (id=$id, email=$email)"
   fi
-  if load_flag_map; then
-    local flag_count
-    flag_count=$(printf '%s' "$FLAG_MAP_JSON" | jq -r '
-      [(.channel_flags // {}) | to_entries[].value[]] | unique | length')
-    echo "Flags defined: $flag_count"
+  local load_rc
+  load_alias_map
+  load_rc=$?
+  if (( load_rc == 0 )); then
+    local alias_count
+    alias_count=$(printf '%s' "$ALIAS_MAP_JSON" | jq -r '
+      [(.channel_aliases // {}) | to_entries[].value[]] | unique | length')
+    echo "Aliases defined: $alias_count"
+  elif (( load_rc == 1 )); then
+    echo "Aliases defined: 0 (run --setup)"
   else
-    echo "Flags defined: 0 (run --setup)"
+    echo "Aliases defined: unreadable (invalid keychain entry)"
   fi
   local last
   last=$(load_last_state) || last=""
@@ -699,7 +717,7 @@ cmd_status() {
     echo
     echo "Last toggle:"
     printf '  ts:       %s\n' "$(printf '%s' "$last" | jq -r '.ts // ""')"
-    printf '  flag:     %s\n' "$(printf '%s' "$last" | jq -r '.flag // .profile // ""')"
+    printf '  alias:    %s\n' "$(printf '%s' "$last" | jq -r '.alias // .flag // .profile // ""')"
     printf '  enabled:  %s\n' "$(printf '%s' "$last" | jq -c '.enabled // []')"
     printf '  disabled: %s\n' "$(printf '%s' "$last" | jq -c '.disabled // []')"
     local errs
@@ -715,463 +733,608 @@ cmd_status() {
 }
 
 # ---------------------------------------------------------------------------
-# Interactive setup TUI
+# Interactive picker (alias-centric)
 # ---------------------------------------------------------------------------
-# Pure bash + ANSI escapes. No curses / whiptail / dialog.
+# Pure bash + ANSI escapes. No `tput cup`, no curses, no whiptail/dialog.
+# Uses ANSI only — \e[2J + \e[H to clear, \e[<row>;<col>H to position,
+# \e[?25l/\e[?25h to hide/show the cursor.
 #
-# Module-level state:
-#   SETUP_NAMES[]        displayName per row
-#   SETUP_IDS[]          channel id per row
-#   SETUP_PLATFORMS[]    platform label per row
-#   SETUP_ACTIVE[]       current active state per row ("true"/"false")
-#   SETUP_ROW_FLAGS[]    comma-separated flag list per row (working copy)
-#   SETUP_FLAGS[]        sorted unique list of known flags
-#   SETUP_ACTIVE_FLAG    currently-focused flag
-#   SETUP_CURSOR         current row index
-#   SETUP_TOP            top row of viewport
+# Module-level state (re-initialized per alias edit):
+#   PICK_NAMES[]        displayName per row (channel)
+#   PICK_IDS[]          channel id per row
+#   PICK_PLATFORMS[]    platform label per row
+#   PICK_ACTIVE[]       current active state per row ("true"/"false")
+#   PICK_SELECTED[]     "1"/"0" — is row in the alias being edited
+#   PICK_CURSOR         current row index
+#   PICK_TOP            top row of viewport
+#   PICK_MSG            optional status message line
+#   PICK_ALIAS          name of alias being edited
+#   PICK_ALLOW_NEW      "1" when n/N should save and start another alias
+#
+# Picker control characters:
+#   ↑/↓ or k/j      move cursor
+#   g / G           jump to top / bottom
+#   Space           toggle selection
+#   Enter / s       save this alias and return (caller decides next step)
+#   n               save this alias and start a new alias (return code 10)
+#   d               delete this alias entirely (return code 11)
+#   q / Esc         save and exit (return code 0)
+#   Ctrl-C          cancel without saving anything from this picker run
 
-SETUP_NAMES=()
-SETUP_IDS=()
-SETUP_PLATFORMS=()
-SETUP_ACTIVE=()
-SETUP_ROW_FLAGS=()
-SETUP_FLAGS=()
-SETUP_ACTIVE_FLAG=""
-SETUP_CURSOR=0
-SETUP_TOP=0
-SETUP_MSG=""
+PICK_NAMES=()
+PICK_IDS=()
+PICK_PLATFORMS=()
+PICK_ACTIVE=()
+PICK_SELECTED=()
+PICK_CURSOR=0
+PICK_TOP=0
+PICK_MSG=""
+PICK_ALIAS=""
+PICK_ALLOW_NEW=1
 
-tui_cleanup() {
-  tput cnorm 2>/dev/null || true
-  tput rmcup 2>/dev/null || true
+# ANSI helpers — used in place of tput for portability.
+ansi_clear()       { printf '\e[2J\e[H'; }
+ansi_hide_cursor() { printf '\e[?25l'; }
+ansi_show_cursor() { printf '\e[?25h'; }
+ansi_cup()         { printf '\e[%d;%dH' "$1" "$2"; }   # row, col (1-indexed)
+ansi_clear_line()  { printf '\e[2K'; }
+
+term_rows() {
+  local r=""
+  if command -v stty >/dev/null 2>&1; then
+    r=$(stty size 2>/dev/null | awk '{print $1}')
+  fi
+  [[ -z "$r" || "$r" -lt 5 ]] && r=24
+  echo "$r"
+}
+term_cols() {
+  local c=""
+  if command -v stty >/dev/null 2>&1; then
+    c=$(stty size 2>/dev/null | awk '{print $2}')
+  fi
+  [[ -z "$c" || "$c" -lt 20 ]] && c=80
+  echo "$c"
+}
+
+picker_cleanup() {
+  ansi_show_cursor
   stty sane 2>/dev/null || true
 }
 
-# Recompute SETUP_FLAGS from SETUP_ROW_FLAGS (unique, sorted), preserving an
-# empty-but-created flag if it's the current SETUP_ACTIVE_FLAG (so that
-# creating a new flag doesn't vanish before the user toggles anything).
-setup_recompute_flags() {
-  local all=()
-  local r f
-  for r in "${SETUP_ROW_FLAGS[@]}"; do
-    [[ -z "$r" ]] && continue
-    IFS=',' read -ra parts <<<"$r"
-    for f in "${parts[@]}"; do
-      f="${f#"${f%%[![:space:]]*}"}"
-      f="${f%"${f##*[![:space:]]}"}"
-      [[ -z "$f" ]] && continue
-      all+=("$f")
-    done
-  done
-  if [[ -n "$SETUP_ACTIVE_FLAG" ]]; then
-    all+=("$SETUP_ACTIVE_FLAG")
+# Populate PICK_NAMES/IDS/PLATFORMS/ACTIVE from CHANNELS_JSON, sorted by
+# (streamingPlatformId, displayName). Sets PICK_SELECTED based on whether
+# each channel is currently in $ALIAS_MAP_JSON for $1 (the alias name).
+picker_populate_for_alias() {
+  local alias_name="$1"
+  PICK_ALIAS="$alias_name"
+  PICK_NAMES=()
+  PICK_IDS=()
+  PICK_PLATFORMS=()
+  PICK_ACTIVE=()
+  PICK_SELECTED=()
+  PICK_CURSOR=0
+  PICK_TOP=0
+  PICK_MSG=""
+
+  local sorted
+  sorted=$(printf '%s' "$CHANNELS_JSON" | jq -c '
+    sort_by([(.streamingPlatformId // .platformId // "" | tostring),
+             (.displayName // "" | ascii_downcase)])')
+
+  # Build a fast lookup of selected ids: jq joins comma-separated.
+  local selected_ids=""
+  if [[ -n "$ALIAS_MAP_JSON" ]]; then
+    selected_ids=$(printf '%s' "$ALIAS_MAP_JSON" | jq -r --arg a "$alias_name" '
+      [(.channel_aliases // {}) | to_entries[]
+        | select((.value // []) | index($a) != null)
+        | .key] | join(",")')
   fi
-  if (( ${#all[@]} == 0 )); then
-    SETUP_FLAGS=()
-  else
-    # Bash 3 portable: use printf + sort -u
-    local sorted
-    sorted=$(printf '%s\n' "${all[@]}" | sort -u)
-    SETUP_FLAGS=()
-    while IFS= read -r line; do
-      [[ -n "$line" ]] && SETUP_FLAGS+=("$line")
-    done <<<"$sorted"
-  fi
-  # keep active flag valid
-  if [[ -n "$SETUP_ACTIVE_FLAG" ]]; then
-    local found=0
-    for f in "${SETUP_FLAGS[@]}"; do
-      [[ "$f" == "$SETUP_ACTIVE_FLAG" ]] && { found=1; break; }
-    done
-    (( found )) || SETUP_ACTIVE_FLAG=""
-  fi
-  if [[ -z "$SETUP_ACTIVE_FLAG" && ${#SETUP_FLAGS[@]} -gt 0 ]]; then
-    SETUP_ACTIVE_FLAG="${SETUP_FLAGS[0]}"
-  fi
+
+  local id name plat active
+  while IFS=$'\t' read -r id name plat active; do
+    PICK_IDS+=("$id")
+    PICK_NAMES+=("${name:-(unnamed)}")
+    PICK_PLATFORMS+=("$plat")
+    PICK_ACTIVE+=("$active")
+    case ",$selected_ids," in
+      *,"$id",*) PICK_SELECTED+=("1") ;;
+      *)         PICK_SELECTED+=("0") ;;
+    esac
+  done < <(printf '%s' "$sorted" | jq -r '.[] |
+    [(.id|tostring),
+     (.displayName // "(unnamed)"),
+     ((.streamingPlatformId // .platformId // "")|tostring),
+     ((if .enabled != null then .enabled elif .active != null then .active else false end) | tostring)] | @tsv')
 }
 
-row_has_flag() {
-  local r="$1" flag="$2"
-  local rf="${SETUP_ROW_FLAGS[$r]:-}"
-  [[ -z "$rf" ]] && return 1
-  local f
-  IFS=',' read -ra parts <<<"$rf"
-  for f in "${parts[@]}"; do
-    f="${f#"${f%%[![:space:]]*}"}"
-    f="${f%"${f##*[![:space:]]}"}"
-    [[ "$f" == "$flag" ]] && return 0
+picker_count_selected() {
+  local i n=0
+  for (( i=0; i<${#PICK_SELECTED[@]}; i++ )); do
+    [[ "${PICK_SELECTED[$i]}" == "1" ]] && n=$((n+1))
   done
-  return 1
+  echo "$n"
 }
 
-toggle_row_flag() {
-  local r="$1" flag="$2"
-  local rf="${SETUP_ROW_FLAGS[$r]:-}"
-  local out=()
-  local found=0 f
-  if [[ -n "$rf" ]]; then
-    IFS=',' read -ra parts <<<"$rf"
-    for f in "${parts[@]}"; do
-      f="${f#"${f%%[![:space:]]*}"}"
-      f="${f%"${f##*[![:space:]]}"}"
-      [[ -z "$f" ]] && continue
-      if [[ "$f" == "$flag" ]]; then
-        found=1
-      else
-        out+=("$f")
-      fi
-    done
-  fi
-  (( ! found )) && out+=("$flag")
-  local joined="" i
-  for ((i=0; i<${#out[@]}; i++)); do
-    if (( i == 0 )); then joined="${out[$i]}"; else joined+=", ${out[$i]}"; fi
-  done
-  SETUP_ROW_FLAGS[$r]="$joined"
-}
-
-format_row_flags() {
-  local r="$1" is_current="$2"
-  local rf="${SETUP_ROW_FLAGS[$r]:-}"
-  if [[ -z "$rf" ]]; then
-    printf '(none)'
-    return
-  fi
-  local f out="" i=0
-  IFS=',' read -ra parts <<<"$rf"
-  for f in "${parts[@]}"; do
-    f="${f#"${f%%[![:space:]]*}"}"
-    f="${f%"${f##*[![:space:]]}"}"
-    [[ -z "$f" ]] && continue
-    (( i > 0 )) && out+=", "
-    if [[ "$f" == "$SETUP_ACTIVE_FLAG" ]]; then
-      out+=$'\e[1;36m'"$f"$'\e[0m'
-      [[ "$is_current" == "1" ]] && out+=$'\e[7m'
-    else
-      out+="$f"
-    fi
-    i=$((i+1))
-  done
-  printf '%s' "$out"
-}
-
-setup_active_flag_index() {
-  local i=0 f
-  for f in "${SETUP_FLAGS[@]}"; do
-    i=$((i+1))
-    [[ "$f" == "$SETUP_ACTIVE_FLAG" ]] && { echo "$i"; return; }
-  done
-  echo 0
-}
-
-tui_draw() {
+picker_draw() {
   local rows cols
-  rows=$(tput lines)
-  cols=$(tput cols)
-  tput clear
+  rows=$(term_rows)
+  cols=$(term_cols)
+  ansi_clear
 
-  tput cup 0 0
-  printf '\e[1mRESTREAM CHANNEL SETUP\e[0m'
-  tput cup 2 0
-  printf 'Map each channel to one or more flags. A flag is just a label you pick'
-  tput cup 3 0
-  printf '(e.g. "wreathen", "3000ad", "main"). Later, `--flag <name>` enables'
-  tput cup 4 0
-  printf 'every channel tagged with <name> and disables the rest.'
-  tput cup 6 0
-  printf '\e[2mUp/Dn or j/k  move   Space  toggle channel in active flag   Tab  next flag\e[0m'
-  tput cup 7 0
-  printf '\e[2mn  new flag    d  delete active flag    s/q  save & quit    Esc  cancel\e[0m'
+  ansi_cup 1 1
+  printf '\e[1mRESTREAM ALIAS:\e[0m \e[1;36m%s\e[0m' "$PICK_ALIAS"
+  local sel total
+  sel=$(picker_count_selected)
+  total=${#PICK_NAMES[@]}
+  ansi_cup 1 $(( cols - 24 ))
+  printf '\e[2m%d of %d selected\e[0m' "$sel" "$total"
 
-  local header_row=9
-  tput cup "$header_row" 0
-  printf '  \e[1m%-3s %-30s  %-3s %-10s  %s\e[0m' "SEL" "CHANNEL" "ON" "PLATFORM" "FLAGS"
+  ansi_cup 3 1
+  if [[ "$PICK_ALLOW_NEW" == "1" ]]; then
+    printf '\e[2mUp/Dn or j/k  move   Space  toggle   Enter/s  save & exit   n  new alias\e[0m'
+  else
+    printf '\e[2mUp/Dn or j/k  move   Space  toggle   Enter/s  save & exit\e[0m'
+  fi
+  ansi_cup 4 1
+  printf '\e[2md  delete this alias    q/Esc  save & exit    Ctrl-C  cancel\e[0m'
 
-  local n=${#SETUP_NAMES[@]}
-  local footer_rows=5
-  local avail=$(( rows - header_row - 2 - footer_rows ))
+  local header_row=6
+  ansi_cup "$header_row" 1
+  printf '\e[1m  %-3s %-14s %-32s %-12s %s\e[0m' \
+    "SEL" "PLATFORM" "CHANNEL" "ID" "ON"
+
+  local n=${#PICK_NAMES[@]}
+  local footer_rows=3
+  local avail=$(( rows - header_row - 1 - footer_rows ))
   (( avail < 3 )) && avail=3
 
-  if (( SETUP_CURSOR < SETUP_TOP )); then SETUP_TOP=$SETUP_CURSOR; fi
-  if (( SETUP_CURSOR >= SETUP_TOP + avail )); then SETUP_TOP=$(( SETUP_CURSOR - avail + 1 )); fi
-  (( SETUP_TOP < 0 )) && SETUP_TOP=0
+  if (( PICK_CURSOR < PICK_TOP )); then PICK_TOP=$PICK_CURSOR; fi
+  if (( PICK_CURSOR >= PICK_TOP + avail )); then PICK_TOP=$(( PICK_CURSOR - avail + 1 )); fi
+  (( PICK_TOP < 0 )) && PICK_TOP=0
 
   local i y=0
-  for (( i=SETUP_TOP; i<n && y<avail; i++, y++ )); do
+  for (( i=PICK_TOP; i<n && y<avail; i++, y++ )); do
     local row=$(( header_row + 1 + y ))
-    tput cup "$row" 0
+    ansi_cup "$row" 1
     local marker="  "
     local is_current=0
-    if (( i == SETUP_CURSOR )); then
+    if (( i == PICK_CURSOR )); then
       marker="> "
       is_current=1
       printf '\e[7m'
     fi
-    local in_flag="[ ]"
-    if [[ -n "$SETUP_ACTIVE_FLAG" ]] && row_has_flag "$i" "$SETUP_ACTIVE_FLAG"; then
+    local sel_mark="[ ]"
+    if [[ "${PICK_SELECTED[$i]}" == "1" ]]; then
       if (( is_current )); then
-        in_flag=$'\e[1;32m[x]\e[0m\e[7m'
+        sel_mark=$'\e[1;32m[x]\e[0m\e[7m'
       else
-        in_flag=$'\e[1;32m[x]\e[0m'
+        sel_mark=$'\e[1;32m[x]\e[0m'
       fi
     fi
     local live="off"
-    if [[ "${SETUP_ACTIVE[$i]}" == "true" ]]; then
+    if [[ "${PICK_ACTIVE[$i]}" == "true" ]]; then
       if (( is_current )); then
         live=$'\e[32mON\e[0m\e[7m'
       else
         live=$'\e[32mON\e[0m'
       fi
     fi
-    local name="${SETUP_NAMES[$i]}"
-    (( ${#name} > 30 )) && name="${name:0:27}..."
-    local plat="${SETUP_PLATFORMS[$i]}"
-    (( ${#plat} > 10 )) && plat="${plat:0:10}"
-    printf '%s%s %-30s  %-3b %-10s  ' "$marker" "$in_flag" "$name" "$live" "$plat"
-    format_row_flags "$i" "$is_current"
+    local plat="${PICK_PLATFORMS[$i]}"
+    (( ${#plat} > 14 )) && plat="${plat:0:14}"
+    local name="${PICK_NAMES[$i]}"
+    (( ${#name} > 32 )) && name="${name:0:29}..."
+    local id="${PICK_IDS[$i]}"
+    (( ${#id} > 12 )) && id="${id:0:12}"
+    printf '%s%s %-14s %-32s %-12s %-3b' "$marker" "$sel_mark" "$plat" "$name" "$id" "$live"
     (( is_current )) && printf '\e[0m'
   done
 
-  local ftop=$(( rows - footer_rows ))
-  tput cup "$ftop" 0
+  local ftop=$(( rows - footer_rows + 1 ))
+  ansi_cup "$ftop" 1
   printf '\e[2m─────────────────────────────────────────────────────────────\e[0m'
-
-  tput cup $(( ftop + 1 )) 0
-  if (( ${#SETUP_FLAGS[@]} == 0 )); then
-    printf 'Active flag: \e[33m(none yet — press n to create one)\e[0m'
-  else
-    printf 'Active flag: \e[1;36m%s\e[0m   (%s of %d — Tab cycles)' \
-      "$SETUP_ACTIVE_FLAG" \
-      "$(setup_active_flag_index)" \
-      "${#SETUP_FLAGS[@]}"
-  fi
-
-  tput cup $(( ftop + 2 )) 0
-  if (( ${#SETUP_FLAGS[@]} > 0 )); then
-    local joined="" i=0 f
-    for f in "${SETUP_FLAGS[@]}"; do
-      (( i > 0 )) && joined+=", "
-      joined+="$f"
-      i=$((i+1))
-    done
-    printf 'All flags: %s' "$joined"
-  else
-    printf 'All flags: (none)'
-  fi
-
-  if [[ -n "$SETUP_MSG" ]]; then
-    tput cup $(( ftop + 3 )) 0
-    printf '\e[33m%s\e[0m' "$SETUP_MSG"
+  if [[ -n "$PICK_MSG" ]]; then
+    ansi_cup $(( ftop + 1 )) 1
+    printf '\e[33m%s\e[0m' "$PICK_MSG"
   fi
 }
 
-tui_prompt_flag_name() {
+# Read a line of input visibly (for prompting alias name). Returns in REPLY.
+picker_prompt_line() {
+  local prompt="$1"
   local rows
-  rows=$(tput lines)
-  tput cup $(( rows - 1 )) 0
-  tput el
-  tput cnorm
-  stty sane
-  printf 'New flag name (letters/digits/_/./-): '
+  rows=$(term_rows)
+  ansi_cup "$rows" 1
+  ansi_clear_line
+  ansi_show_cursor
+  stty sane 2>/dev/null || true
+  printf '%s' "$prompt"
   IFS= read -r REPLY
-  tput civis
-  stty -echo
+  ansi_hide_cursor
+  stty -echo 2>/dev/null || true
 }
 
-setup_cycle_active_flag() {
-  local n=${#SETUP_FLAGS[@]}
-  (( n == 0 )) && return
-  local idx=0 i
-  for (( i=0; i<n; i++ )); do
-    if [[ "${SETUP_FLAGS[$i]}" == "$SETUP_ACTIVE_FLAG" ]]; then
-      idx=$(( (i + 1) % n ))
-      break
-    fi
-  done
-  SETUP_ACTIVE_FLAG="${SETUP_FLAGS[$idx]}"
-}
-
-setup_delete_active_flag() {
-  local flag="$SETUP_ACTIVE_FLAG"
-  [[ -z "$flag" ]] && return
-  local i
-  for (( i=0; i<${#SETUP_ROW_FLAGS[@]}; i++ )); do
-    if row_has_flag "$i" "$flag"; then
-      toggle_row_flag "$i" "$flag"
-    fi
-  done
-  SETUP_ACTIVE_FLAG=""
-  setup_recompute_flags
-  SETUP_MSG="Deleted flag '$flag'"
-}
-
-setup_new_flag() {
-  tui_prompt_flag_name
-  local name="$REPLY"
+# Sanitize/validate an alias name. Echoes the cleaned name, or empty on
+# rejection. Prints reason to stderr if rejected.
+sanitize_alias_name() {
+  local name="$1"
   name="${name#"${name%%[![:space:]]*}"}"
   name="${name%"${name##*[![:space:]]}"}"
   if [[ -z "$name" ]]; then
-    SETUP_MSG="Cancelled: empty flag name."
-    return
+    echo ""
+    return 1
   fi
   if ! [[ "$name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
-    SETUP_MSG="Rejected: only letters/digits/_/./- allowed."
-    return
+    echo ""
+    return 1
   fi
-  SETUP_ACTIVE_FLAG="$name"
-  setup_recompute_flags
-  SETUP_MSG="Created flag '$name'. Press Space on each channel you want to include."
+  printf '%s' "$name"
 }
 
-setup_toggle_current() {
-  if [[ -z "$SETUP_ACTIVE_FLAG" ]]; then
-    SETUP_MSG="No active flag. Press n to create one first."
-    return
+# Update ALIAS_MAP_JSON: set the membership of $alias_name to PICK_SELECTED
+# rows. Persists to keychain.
+picker_save_to_alias_map() {
+  local alias_name="$1"
+  local previous_map="$ALIAS_MAP_JSON"
+  local load_rc
+  load_alias_map >/dev/null 2>&1
+  load_rc=$?
+  if (( load_rc == 1 )); then
+    ALIAS_MAP_JSON="$previous_map"
+  elif (( load_rc != 0 )); then
+    ALIAS_MAP_JSON="$previous_map"
+    return 1
   fi
-  toggle_row_flag "$SETUP_CURSOR" "$SETUP_ACTIVE_FLAG"
-  setup_recompute_flags
-  SETUP_MSG=""
-}
-
-setup_save() {
-  local n=${#SETUP_IDS[@]} i
-  local map_json='{"channel_flags":{}}'
-  for (( i=0; i<n; i++ )); do
-    local id="${SETUP_IDS[$i]}"
-    local rf="${SETUP_ROW_FLAGS[$i]:-}"
-    local arr='[]' f
-    if [[ -n "$rf" ]]; then
-      IFS=',' read -ra parts <<<"$rf"
-      for f in "${parts[@]}"; do
-        f="${f#"${f%%[![:space:]]*}"}"
-        f="${f%"${f##*[![:space:]]}"}"
-        [[ -z "$f" ]] && continue
-        arr=$(jq -cn --argjson a "$arr" --arg f "$f" '$a + [$f]')
-      done
-    fi
-    if [[ "$arr" != "[]" ]]; then
-      map_json=$(jq -cn --argjson m "$map_json" --arg id "$id" --argjson a "$arr" \
-        '$m | .channel_flags[$id] = $a')
-    fi
+  # Start from existing map (or empty).
+  local map_json
+  if [[ -n "$ALIAS_MAP_JSON" ]]; then
+    map_json="$ALIAS_MAP_JSON"
+  else
+    map_json='{"channel_aliases":{}}'
+  fi
+  # Strip $alias_name from every channel's list first.
+  map_json=$(printf '%s' "$map_json" | jq -c --arg a "$alias_name" '
+    .channel_aliases = ((.channel_aliases // {}) | with_entries(
+      .value = ((.value // []) | map(select(. != $a)))
+    ))')
+  # Then add it for every PICK_SELECTED=="1" row.
+  local i
+  for (( i=0; i<${#PICK_IDS[@]}; i++ )); do
+    [[ "${PICK_SELECTED[$i]}" == "1" ]] || continue
+    local id="${PICK_IDS[$i]}"
+    map_json=$(printf '%s' "$map_json" | jq -c --arg id "$id" --arg a "$alias_name" '
+      .channel_aliases[$id] = (((.channel_aliases[$id] // []) + [$a]) | unique)')
   done
-  save_flag_map "$map_json"
-  FLAG_MAP_JSON="$map_json"
+  # Drop now-empty channel entries so the map stays clean.
+  map_json=$(printf '%s' "$map_json" | jq -c '
+    .channel_aliases = ((.channel_aliases // {}) | with_entries(
+      select((.value // []) | length > 0)
+    ))')
+  save_alias_map "$map_json" || return 1
+  ALIAS_MAP_JSON="$map_json"
 }
 
-cmd_setup() {
-  ensure_valid_tokens
-  echo "Fetching channels..."
-  fetch_channels
-
-  local sorted
-  sorted=$(printf '%s' "$CHANNELS_JSON" | jq -c 'sort_by(.displayName // "" | ascii_downcase)')
-  local n
-  n=$(printf '%s' "$sorted" | jq 'length')
-
-  SETUP_NAMES=()
-  SETUP_IDS=()
-  SETUP_PLATFORMS=()
-  SETUP_ACTIVE=()
-  SETUP_ROW_FLAGS=()
-
-  # Single jq pass, TSV-formatted
-  while IFS=$'\t' read -r id name plat active; do
-    SETUP_IDS+=("$id")
-    SETUP_NAMES+=("${name:-(unnamed)}")
-    SETUP_PLATFORMS+=("$plat")
-    SETUP_ACTIVE+=("$active")
-    SETUP_ROW_FLAGS+=("")
-  done < <(printf '%s' "$sorted" | jq -r '.[] |
-    [(.id|tostring),
-     (.displayName // "(unnamed)"),
-     ((.streamingPlatformId // .platformId // "")|tostring),
-     (.active // false | tostring)] | @tsv')
-
-  if load_flag_map; then
-    local i
-    for (( i=0; i<${#SETUP_IDS[@]}; i++ )); do
-      local id="${SETUP_IDS[$i]}"
-      local existing
-      existing=$(printf '%s' "$FLAG_MAP_JSON" \
-        | jq -r --arg id "$id" '(.channel_flags[$id] // []) | join(", ")')
-      SETUP_ROW_FLAGS[$i]="$existing"
-    done
+# Delete an alias entirely (remove from every channel).
+picker_delete_alias() {
+  local alias_name="$1"
+  local previous_map="$ALIAS_MAP_JSON"
+  local load_rc
+  load_alias_map >/dev/null 2>&1
+  load_rc=$?
+  if (( load_rc == 1 )); then
+    ALIAS_MAP_JSON="$previous_map"
+  elif (( load_rc != 0 )); then
+    ALIAS_MAP_JSON="$previous_map"
+    return 1
   fi
+  local map_json
+  if [[ -n "$ALIAS_MAP_JSON" ]]; then
+    map_json="$ALIAS_MAP_JSON"
+  else
+    map_json='{"channel_aliases":{}}'
+  fi
+  map_json=$(printf '%s' "$map_json" | jq -c --arg a "$alias_name" '
+    .channel_aliases = ((.channel_aliases // {}) | with_entries(
+      .value = ((.value // []) | map(select(. != $a)))
+    ) | with_entries(
+      select((.value // []) | length > 0)
+    ))')
+  save_alias_map "$map_json" || return 1
+  ALIAS_MAP_JSON="$map_json"
+}
 
-  setup_recompute_flags
-  SETUP_CURSOR=0
-  SETUP_TOP=0
-  SETUP_MSG=""
+picker_finish_saved() {
+  local alias_name="$1" rc="$2"
+  if ! picker_save_to_alias_map "$alias_name"; then
+    picker_cleanup
+    trap - INT
+    ansi_clear
+    echo "Failed to save alias '$alias_name' to Keychain." >&2
+    return "$EXIT_NETWORK"
+  fi
+  picker_cleanup
+  trap - INT
+  ansi_clear
+  echo "Saved alias '$alias_name' ($(picker_count_selected) channel(s))."
+  return "$rc"
+}
 
-  if (( ${#SETUP_NAMES[@]} == 0 )); then
+# Run the picker for $1 = alias name. Returns:
+#   0  saved & exit (q/Esc/Enter/s)
+#   10 saved & user wants new alias (n)
+#   11 alias deleted (d) — caller decides what next
+#   130 user cancelled with Ctrl-C (no save)
+run_picker() {
+  local alias_name="$1"
+  local allow_new="${2:-1}"
+
+  # Trap Ctrl-C: cleanup + return 130. We can't `return` from a trap in a
+  # straightforward way, so set a flag and check after read.
+  PICK_CANCELLED=0
+  PICK_ALLOW_NEW="$allow_new"
+  # shellcheck disable=SC2064
+  trap 'PICK_CANCELLED=1' INT
+
+  picker_populate_for_alias "$alias_name"
+
+  ansi_hide_cursor
+  stty -echo 2>/dev/null || true
+
+  local n=${#PICK_NAMES[@]}
+  if (( n == 0 )); then
+    picker_cleanup
+    trap - INT
     echo "No channels found on your Restream account. Add some at restream.io first." >&2
     return "$EXIT_NO_MATCH"
   fi
 
-  tput smcup 2>/dev/null || true
-  tput civis 2>/dev/null || true
-  stty -echo 2>/dev/null || true
-  trap tui_cleanup EXIT INT TERM
-
-  n=${#SETUP_NAMES[@]}
-  # Bash 3.2 (stock macOS) doesn't accept fractional `read -t` values.
-  # Bash 4+ does. Pick the smallest valid timeout per version. For arrow-key
-  # sequences (\e[A etc) we only need a brief pause so we don't hang on a
-  # bare Esc press.
   local esc_timeout=1
   if [[ ${BASH_VERSINFO[0]:-3} -ge 4 ]]; then
     esc_timeout="0.05"
   fi
   local key c2 c3
   while :; do
-    tui_draw
-    IFS= read -rsn1 key || break
+    if (( PICK_CANCELLED )); then
+      picker_cleanup
+      trap - INT
+      ansi_clear
+      echo "Cancelled. Changes for alias '$alias_name' NOT saved."
+      return 130
+    fi
+    picker_draw
+    if ! IFS= read -rsn1 key; then
+      if (( PICK_CANCELLED )); then
+        picker_cleanup
+        trap - INT
+        ansi_clear
+        echo "Cancelled. Changes for alias '$alias_name' NOT saved."
+        return 130
+      fi
+      break
+    fi
     case "$key" in
       $'\e')
         c2=""
         IFS= read -rsn1 -t "$esc_timeout" c2 || c2=""
         if [[ -z "$c2" ]]; then
-          tui_cleanup
-          trap - EXIT INT TERM
-          echo "Setup cancelled. No changes saved."
-          return "$EXIT_OK"
+          # Bare Esc => save and exit.
+          picker_finish_saved "$alias_name" 0
+          return $?
         fi
         if [[ "$c2" == "[" || "$c2" == "O" ]]; then
           c3=""
           IFS= read -rsn1 -t "$esc_timeout" c3 || c3=""
           case "$c3" in
-            A) (( SETUP_CURSOR > 0 )) && SETUP_CURSOR=$((SETUP_CURSOR - 1)); SETUP_MSG="" ;;
-            B) (( SETUP_CURSOR < n - 1 )) && SETUP_CURSOR=$((SETUP_CURSOR + 1)); SETUP_MSG="" ;;
+            A) (( PICK_CURSOR > 0 )) && PICK_CURSOR=$((PICK_CURSOR - 1)); PICK_MSG="" ;;
+            B) (( PICK_CURSOR < n - 1 )) && PICK_CURSOR=$((PICK_CURSOR + 1)); PICK_MSG="" ;;
             *) : ;;
           esac
         fi
         ;;
-      k) (( SETUP_CURSOR > 0 )) && SETUP_CURSOR=$((SETUP_CURSOR - 1)); SETUP_MSG="" ;;
-      j) (( SETUP_CURSOR < n - 1 )) && SETUP_CURSOR=$((SETUP_CURSOR + 1)); SETUP_MSG="" ;;
-      g) SETUP_CURSOR=0; SETUP_MSG="" ;;
-      G) SETUP_CURSOR=$(( n - 1 )); SETUP_MSG="" ;;
-      ' ') setup_toggle_current ;;
-      $'\t') setup_cycle_active_flag; SETUP_MSG="" ;;
-      n|N) setup_new_flag ;;
-      d|D) setup_delete_active_flag ;;
-      s|S|q|Q)
-        setup_save
-        tui_cleanup
-        trap - EXIT INT TERM
-        local total_flags=${#SETUP_FLAGS[@]}
-        local total_mapped
-        total_mapped=$(printf '%s' "$FLAG_MAP_JSON" | jq '[.channel_flags | to_entries[] | select(.value | length > 0)] | length')
-        echo "Saved: $total_flags flag(s) across $total_mapped channel(s)."
-        echo "Run '--flags' to list them, '--flag <name>' to apply."
-        log_event action setup result ok flags "$total_flags"
-        return "$EXIT_OK"
+      k) (( PICK_CURSOR > 0 )) && PICK_CURSOR=$((PICK_CURSOR - 1)); PICK_MSG="" ;;
+      j) (( PICK_CURSOR < n - 1 )) && PICK_CURSOR=$((PICK_CURSOR + 1)); PICK_MSG="" ;;
+      g) PICK_CURSOR=0; PICK_MSG="" ;;
+      G) PICK_CURSOR=$(( n - 1 )); PICK_MSG="" ;;
+      ' ')
+        if [[ "${PICK_SELECTED[$PICK_CURSOR]}" == "1" ]]; then
+          PICK_SELECTED[$PICK_CURSOR]="0"
+        else
+          PICK_SELECTED[$PICK_CURSOR]="1"
+        fi
+        PICK_MSG=""
+        ;;
+      ''|$'\n'|$'\r'|s|S)
+        # Enter / s = save + exit picker.
+        picker_finish_saved "$alias_name" 0
+        return $?
+        ;;
+      n|N)
+        if [[ "$PICK_ALLOW_NEW" == "1" ]]; then
+          # Save current alias, signal caller to start another.
+          picker_finish_saved "$alias_name" 10
+          return $?
+        fi
+        PICK_MSG="Single-alias mode: press Enter/s/q/Esc to save and exit."
+        ;;
+      d|D)
+        # Delete this alias (with confirm).
+        picker_prompt_line "Delete alias '$alias_name' from every channel? [y/N]: "
+        if [[ "$REPLY" == "y" || "$REPLY" == "Y" ]]; then
+          if ! picker_delete_alias "$alias_name"; then
+            picker_cleanup
+            trap - INT
+            ansi_clear
+            echo "Failed to delete alias '$alias_name' from Keychain." >&2
+            return "$EXIT_NETWORK"
+          fi
+          picker_cleanup
+          trap - INT
+          ansi_clear
+          echo "Deleted alias '$alias_name'."
+          return 11
+        else
+          PICK_MSG="Delete cancelled."
+        fi
+        ;;
+      q|Q)
+        picker_finish_saved "$alias_name" 0
+        return $?
         ;;
       *) : ;;
     esac
   done
 
-  tui_cleanup
-  trap - EXIT INT TERM
+  picker_cleanup
+  trap - INT
+  return 0
+}
+
+# Pick or create an alias name interactively. Echoes the name on stdout,
+# returns 1 if user aborted.
+prompt_alias_choice() {
+  local existing
+  existing=$(printf '%s' "$ALIAS_MAP_JSON" 2>/dev/null \
+    | jq -r '[(.channel_aliases // {}) | to_entries[].value[]] | unique | .[]' 2>/dev/null \
+    || true)
+  echo >&2
+  if [[ -n "$existing" ]]; then
+    echo "Existing aliases:" >&2
+    printf '  %s\n' $existing >&2
+    echo >&2
+    echo "Type an existing alias to edit it, or a new name to create one." >&2
+  else
+    echo "No aliases yet. Pick a name for your first one." >&2
+    echo "Names: letters/digits/_/./- (e.g. 'wreathen', 'main', 'podcast.live')." >&2
+  fi
+  printf 'Alias name (empty to abort): ' >&2
+  local name
+  IFS= read -r name
+  local clean
+  clean=$(sanitize_alias_name "$name") || clean=""
+  if [[ -z "$clean" ]]; then
+    if [[ -z "$name" ]]; then
+      echo "Aborted." >&2
+    else
+      echo "Rejected: only letters/digits/_/./- allowed (got '$name')." >&2
+    fi
+    return 1
+  fi
+  printf '%s' "$clean"
+}
+
+cmd_setup() {
+  ensure_valid_tokens
+  echo "Fetching channels..."
+  fetch_channels
+  local load_rc
+  load_alias_map
+  load_rc=$?
+  if (( load_rc == 1 )); then
+    ALIAS_MAP_JSON=""
+  elif (( load_rc != 0 )); then
+    return "$EXIT_NETWORK"
+  fi
+
+  while :; do
+    local name
+    if ! name=$(prompt_alias_choice); then
+      break
+    fi
+    if [[ -z "$name" ]]; then
+      break
+    fi
+
+    local rc
+    run_picker "$name"
+    rc=$?
+
+    case "$rc" in
+      0)
+        # Saved. Ask whether to add another.
+        printf 'Add another alias? [y/N]: '
+        local ans
+        IFS= read -r ans
+        case "$ans" in
+          y|Y|yes|YES) continue ;;
+          *) break ;;
+        esac
+        ;;
+      10)
+        # 'n' inside picker — go straight to next alias.
+        continue
+        ;;
+      11)
+        # Deleted. Ask whether to do something else.
+        printf 'Add or edit another alias? [y/N]: '
+        local ans2
+        IFS= read -r ans2
+        case "$ans2" in
+          y|Y|yes|YES) continue ;;
+          *) break ;;
+        esac
+        ;;
+      130)
+        # Cancelled.
+        break
+        ;;
+      "$EXIT_NETWORK")
+        return "$EXIT_NETWORK"
+        ;;
+      *)
+        return "$rc"
+        ;;
+    esac
+  done
+
+  local total_aliases=0 total_mapped=0
+  if [[ -n "$ALIAS_MAP_JSON" ]]; then
+    total_aliases=$(printf '%s' "$ALIAS_MAP_JSON" | jq '
+      [(.channel_aliases // {}) | to_entries[].value[]] | unique | length')
+    total_mapped=$(printf '%s' "$ALIAS_MAP_JSON" | jq '
+      [(.channel_aliases // {}) | to_entries[] | select((.value // []) | length > 0)] | length')
+  fi
+  echo "Saved: $total_aliases alias(es) across $total_mapped channel(s)."
+  echo "Run '--aliases' to list them, '--alias <name>' to apply."
+  log_event action setup result ok aliases "$total_aliases"
+  return "$EXIT_OK"
+}
+
+cmd_add_alias() {
+  local name="$1"
+  local clean
+  clean=$(sanitize_alias_name "$name") || clean=""
+  if [[ -z "$clean" ]]; then
+    echo "error: alias name '$name' is invalid (use letters/digits/_/./-)." >&2
+    return 2
+  fi
+
+  ensure_valid_tokens
+  echo "Fetching channels..."
+  fetch_channels
+  local load_rc
+  load_alias_map
+  load_rc=$?
+  if (( load_rc == 1 )); then
+    ALIAS_MAP_JSON=""
+  elif (( load_rc != 0 )); then
+    return "$EXIT_NETWORK"
+  fi
+
+  local rc
+  run_picker "$clean" 0
+  rc=$?
+  case "$rc" in
+    0|10|11) ;;
+    130) return "$EXIT_OK" ;;
+    *) return "$rc" ;;
+  esac
+
+  local total_aliases=0
+  if [[ -n "$ALIAS_MAP_JSON" ]]; then
+    total_aliases=$(printf '%s' "$ALIAS_MAP_JSON" | jq '
+      [(.channel_aliases // {}) | to_entries[].value[]] | unique | length')
+  fi
+  log_event action add-alias alias "$clean" result ok total "$total_aliases"
+  return "$EXIT_OK"
 }
 
 # ---------------------------------------------------------------------------
@@ -1184,69 +1347,123 @@ restream-channel-switch — toggle Restream streaming destinations via the Restr
 Usage:
   restream-channel-switch --auth
   restream-channel-switch --setup
+  restream-channel-switch --add-alias NAME
   restream-channel-switch --list
-  restream-channel-switch --flags
-  restream-channel-switch --flag NAME [--dry-run]
-  restream-channel-switch --enable NAME [--enable NAME ...] [--disable NAME ...]
+  restream-channel-switch --aliases
+  restream-channel-switch --alias NAME [--dry-run]
   restream-channel-switch --status
   restream-channel-switch --reset-creds
   restream-channel-switch --help
 
 Options:
   --auth              Run OAuth flow; store client creds + tokens in Keychain.
-  --setup             Interactive TUI: assign channels to flags. Run once
-                      (and whenever you add/remove Restream channels).
-  --list              List channels with current active state.
-  --flags             List all defined flags and channel counts.
-  --flag NAME         Enable every channel tagged with flag NAME; disable the rest.
-  --dry-run           With --flag: preview changes without applying.
-  --enable NAME       Enable a single channel by name (repeatable).
-  --disable NAME      Disable a single channel by name (repeatable).
+  --setup             Interactive picker: create/edit aliases, multi-select
+                      channels per alias, optionally add more aliases.
+  --add-alias NAME    Open the picker scoped to a single alias (creates if missing).
+  --list              List channels with current active state, sorted by platform.
+  --aliases           List all defined aliases and channel counts.
+  --alias NAME        Enable every channel tagged with alias NAME; disable the rest.
+  --dry-run           With --alias: preview changes without applying.
   --status            Show user profile + last toggle + current state.
-  --reset-creds       Delete stored client credentials, tokens, last state, and flag map.
+  --reset-creds       Delete stored client credentials, tokens, last state, and alias map.
   --help, -h          Show this help.
 
 Exit codes:
   0 success, 1 auth error, 2 network/API error,
-  3 flag didn't match any channels, 4 partial success,
-  5 no flag mapping yet (run --setup).
+  3 alias didn't match any channels, 4 partial success,
+  5 no alias mapping yet (run --setup).
+
+Deprecated (still work, with a warning):
+  --flags             alias for --aliases
+  --flag NAME         alias for --alias NAME
 EOF
 }
 
 main() {
-  local do_auth=0 do_setup=0 do_list=0 do_flags=0 do_status=0 do_reset=0
-  local flag="" dry=0
-  local enable_list="" disable_list=""
+  local do_auth=0 do_setup=0 do_list=0 do_aliases=0 do_status=0 do_reset=0
+  local alias_name="" dry=0
+  local add_alias_name=""
+  local saw_deprecated=0
 
   while (( $# > 0 )); do
     case "$1" in
       --auth)         do_auth=1 ;;
       --setup)        do_setup=1 ;;
       --list)         do_list=1 ;;
-      --flags)        do_flags=1 ;;
+      --aliases)      do_aliases=1 ;;
       --status)       do_status=1 ;;
       --reset-creds)  do_reset=1 ;;
       --dry-run)      dry=1 ;;
-      --flag)         flag="${2-}"; shift ;;
-      --flag=*)       flag="${1#*=}" ;;
-      --profile|--profile=*)
-        echo "error: --profile was removed. Use --flag <name> instead (see --setup)." >&2
+      --alias)
+        if (( $# < 2 )) || [[ "${2-}" == --* ]]; then
+          echo "error: --alias requires a name." >&2
+          return 2
+        fi
+        alias_name="${2-}"; shift ;;
+      --alias=*)
+        alias_name="${1#*=}"
+        if [[ -z "$alias_name" ]]; then
+          echo "error: --alias requires a name." >&2
+          return 2
+        fi
+        ;;
+      --add-alias)
+        if (( $# < 2 )) || [[ "${2-}" == --* ]]; then
+          echo "error: --add-alias requires a name." >&2
+          return 2
+        fi
+        add_alias_name="${2-}"; shift ;;
+      --add-alias=*)
+        add_alias_name="${1#*=}"
+        if [[ -z "$add_alias_name" ]]; then
+          echo "error: --add-alias requires a name." >&2
+          return 2
+        fi
+        ;;
+      # Deprecated synonyms, kept for one release.
+      --flags)
+        echo "warning: --flags is deprecated; use --aliases. (still works for now)" >&2
+        do_aliases=1; saw_deprecated=1 ;;
+      --flag)
+        echo "warning: --flag is deprecated; use --alias. (still works for now)" >&2
+        if (( $# < 2 )) || [[ "${2-}" == --* ]]; then
+          echo "error: --flag requires a name." >&2
+          return 2
+        fi
+        alias_name="${2-}"; shift; saw_deprecated=1 ;;
+      --flag=*)
+        echo "warning: --flag is deprecated; use --alias. (still works for now)" >&2
+        alias_name="${1#*=}"
+        if [[ -z "$alias_name" ]]; then
+          echo "error: --flag requires a name." >&2
+          return 2
+        fi
+        saw_deprecated=1 ;;
+      # Removed: --enable / --disable substring matchers.
+      --enable|--enable=*|--disable|--disable=*)
+        echo "error: --enable/--disable were removed in v2.1." >&2
+        echo "       Substring matching of channel names was too imprecise." >&2
+        echo "       Create an alias instead: --add-alias <name>" >&2
         return 2 ;;
-      --enable)       enable_list+="${2-}"$'\n'; shift ;;
-      --enable=*)     enable_list+="${1#*=}"$'\n' ;;
-      --disable)      disable_list+="${2-}"$'\n'; shift ;;
-      --disable=*)    disable_list+="${1#*=}"$'\n' ;;
+      --profile|--profile=*)
+        echo "error: --profile was removed. Use --alias <name> (see --setup)." >&2
+        return 2 ;;
       -h|--help)      print_help; return 0 ;;
       *)              echo "unknown argument: $1" >&2; print_help >&2; return 2 ;;
     esac
     shift
   done
 
+  if (( saw_deprecated )); then
+    log_event action deprecated-flag-used result warn
+  fi
+
   if (( do_reset )); then
     kc_delete "$KC_ACCOUNT_TOKENS"
     kc_delete "$KC_ACCOUNT_CLIENT"
     kc_delete "$KC_ACCOUNT_STATE"
-    kc_delete "$KC_ACCOUNT_FLAGS"
+    kc_delete "$KC_ACCOUNT_ALIASES"
+    kc_delete "$KC_ACCOUNT_ALIASES_LEGACY"
     echo "Cleared keychain entries for $KEYCHAIN_SERVICE."
     return "$EXIT_OK"
   fi
@@ -1261,6 +1478,11 @@ main() {
     return $?
   fi
 
+  if [[ -n "$add_alias_name" ]]; then
+    cmd_add_alias "$add_alias_name"
+    return $?
+  fi
+
   ensure_valid_tokens
 
   if (( do_status )); then
@@ -1271,16 +1493,12 @@ main() {
     cmd_list
     return "$EXIT_OK"
   fi
-  if (( do_flags )); then
-    cmd_flags
+  if (( do_aliases )); then
+    cmd_aliases
     return $?
   fi
-  if [[ -n "$flag" ]]; then
-    cmd_flag "$flag" "$dry"
-    return $?
-  fi
-  if [[ -n "$enable_list" || -n "$disable_list" ]]; then
-    cmd_enable_disable "${enable_list%$'\n'}" "${disable_list%$'\n'}"
+  if [[ -n "$alias_name" ]]; then
+    cmd_alias "$alias_name" "$dry"
     return $?
   fi
 
