@@ -1,6 +1,6 @@
 # restream-channel-switcher
 
-A pure-bash CLI that toggles your [Restream.io](https://restream.io) streaming destinations on/off in one shot. You define **aliases** (labels like `wreathen`, `3000ad`, `main`) once via an interactive setup, multi-select which Restream channels belong to each alias, and from then on `--alias wreathen` enables every channel in that alias and disables everything else.
+A pure-bash CLI that toggles your [Restream.io](https://restream.io) streaming destinations on/off in one shot. You define **aliases** (labels like `reeethan`, `3000ad`, `main`) once via an interactive setup, multi-select which Restream channels belong to each alias, and from then on `--alias reeethan` enables every channel in that alias and disables everything else.
 
 Designed to be fired from a scene-switch hook (e.g. [OBScene](https://github.com/EthanSK/OBScene)) so switching scenes automatically flips which Restream destinations go live.
 
@@ -61,7 +61,7 @@ restream-channel-switch --setup
 This prompts you for an alias name and then launches an interactive picker listing every Restream channel on your account — sorted by platform, with full platform ID + display name + channel ID so you can disambiguate channels that share a display name (e.g. multiple "REEEthan" entries on different platforms). Space-toggle each channel into the alias. When you're done, save and you'll be asked whether to add another alias.
 
 ```
-RESTREAM ALIAS: wreathen                              3 of 13 selected
+RESTREAM ALIAS: reeethan                              3 of 13 selected
 
 Up/Dn or j/k  move   Space  toggle   Enter/s  save & exit   n  new alias
 d  delete this alias    q/Esc  save & exit    Ctrl-C  cancel
@@ -96,7 +96,7 @@ Top of screen shows the alias name + "X of Y selected" so you always know exactl
 If you just want to tweak one alias without going through the whole flow:
 
 ```bash
-restream-channel-switch --add-alias wreathen
+restream-channel-switch --add-alias reeethan
 ```
 
 `--add-alias` opens the picker scoped to that alias (creates it if it doesn't exist), saves on exit, and returns to the shell.
@@ -108,9 +108,9 @@ Re-run `--setup` or `--add-alias` any time you add/remove Restream channels or w
 ```bash
 restream-channel-switch --list                       # all channels + on/off state, sorted by platform
 restream-channel-switch --aliases                    # list defined aliases + channel counts
-restream-channel-switch --alias wreathen             # enable channels in alias "wreathen", disable everything else
-restream-channel-switch --alias wreathen --dry-run   # preview, no API writes
-restream-channel-switch --add-alias wreathen        # open picker for one alias only
+restream-channel-switch --alias reeethan             # enable channels in alias "reeethan", disable everything else
+restream-channel-switch --alias reeethan --dry-run   # preview, no API writes
+restream-channel-switch --add-alias reeethan        # open picker for one alias only
 restream-channel-switch --status                     # user info + last toggle + current state
 restream-channel-switch --reset-creds                # wipe all keychain entries
 restream-channel-switch --help
@@ -121,7 +121,7 @@ restream-channel-switch --help
 [OBScene](https://github.com/EthanSK/OBScene) exposes a per-profile "Run Script" field. Point it at this CLI with an `--alias` argument and OBScene will fire it on profile activation:
 
 ```
-/Users/you/.local/bin/restream-channel-switch --alias wreathen
+/Users/you/.local/bin/restream-channel-switch --alias reeethan
 ```
 
 No daemons, no USB watchers, no launchd plists — OBScene handles the trigger; this script handles the API call. That's the whole loop.
@@ -183,7 +183,7 @@ If you were using the original `--profile NAME` substring-matcher:
 2. Update the symlink: `ln -sf ~/Projects/restream-channel-switcher/restream-channel-switch.sh ~/.local/bin/restream-channel-switch` and optionally `ln -s ~/.local/bin/restream-channel-switch ~/.local/bin/restream-profile` for backwards compat.
 3. Your existing OAuth tokens still work (same Keychain entries).
 4. Run `restream-channel-switch --setup` to create explicit alias-to-channel mappings.
-5. Replace `--profile wreathen` with `--alias wreathen` in any callers (OBScene, scripts, etc.). The CLI will error clearly if `--profile` is passed.
+5. Replace `--profile reeethan` with `--alias reeethan` in any callers (OBScene, scripts, etc.). The CLI will error clearly if `--profile` is passed.
 
 ## Restream API endpoints used
 

@@ -572,12 +572,35 @@ cmd_list() {
   fetch_channels
   printf '%-6s %-12s %-14s %s\n' "STATE" "ID" "PLATFORM" "NAME"
   printf '%s' "$CHANNELS_JSON" \
-    | jq -r 'def live: if .enabled != null then .enabled elif .active != null then .active else false end;
-      sort_by([(.streamingPlatformId // .platformId // "" | tostring),
-                     (.displayName // "" | ascii_downcase)]) | .[]
+    | jq -r '
+      def live: if .enabled != null then .enabled elif .active != null then .active else false end;
+      def platform_name:
+        ((.url // "") | ascii_downcase) as $u |
+        if   ($u | test("youtube\\.com|youtu\\.be")) then "YouTube"
+        elif ($u | test("twitch\\.tv"))               then "Twitch"
+        elif ($u | test("kick\\.com"))                then "Kick"
+        elif ($u | test("rumble\\.com"))              then "Rumble"
+        elif ($u | test("facebook\\.com|fb\\.com"))   then "Facebook"
+        elif ($u | test("linkedin\\.com"))            then "LinkedIn"
+        elif ($u | test("mixcloud\\.com"))            then "Mixcloud"
+        elif ($u | test("dlive\\.tv"))                then "DLive"
+        elif ($u | test("trovo\\.live"))              then "Trovo"
+        elif ($u | test("tiktok\\.com"))              then "TikTok"
+        elif ($u | test("instagram\\.com"))           then "Instagram"
+        elif ($u | test("x\\.com|twitter\\.com"))     then "X"
+        elif ((.identifier // "") | startswith("dlive-")) then "DLive"
+        else (.streamingPlatformId // .platformId // 0) as $pid
+             | (if   $pid == 1  then "Twitch"
+                elif $pid == 5  then "YouTube"
+                elif $pid == 57 then "DLive"
+                elif $pid == 68 then "Mixcloud"
+                else "plat-" + ($pid | tostring)
+                end)
+        end;
+      sort_by([platform_name, (.displayName // "" | ascii_downcase)]) | .[]
       | [(if live then "ON " else "off" end),
          (.id // "" | tostring),
-         ((.streamingPlatformId // .platformId // "") | tostring),
+         platform_name,
          (.displayName // "")] | @tsv' \
     | awk -F'\t' '{printf "%-6s %-12s %-14s %s\n", $1, $2, $3, $4}'
   local total active
@@ -818,8 +841,24 @@ picker_populate_for_alias() {
 
   local sorted
   sorted=$(printf '%s' "$CHANNELS_JSON" | jq -c '
-    sort_by([(.streamingPlatformId // .platformId // "" | tostring),
-             (.displayName // "" | ascii_downcase)])')
+    def platform_name:
+      ((.url // "") | ascii_downcase) as $u |
+      if   ($u | test("youtube\\.com|youtu\\.be")) then "YouTube"
+      elif ($u | test("twitch\\.tv"))               then "Twitch"
+      elif ($u | test("kick\\.com"))                then "Kick"
+      elif ($u | test("rumble\\.com"))              then "Rumble"
+      elif ($u | test("facebook\\.com|fb\\.com"))   then "Facebook"
+      elif ($u | test("linkedin\\.com"))            then "LinkedIn"
+      elif ($u | test("mixcloud\\.com"))            then "Mixcloud"
+      elif ($u | test("dlive\\.tv"))                then "DLive"
+      elif ($u | test("trovo\\.live"))              then "Trovo"
+      elif ($u | test("tiktok\\.com"))              then "TikTok"
+      elif ($u | test("instagram\\.com"))           then "Instagram"
+      elif ($u | test("x\\.com|twitter\\.com"))     then "X"
+      elif ((.identifier // "") | startswith("dlive-")) then "DLive"
+      else "plat-" + ((.streamingPlatformId // .platformId // "?") | tostring)
+      end;
+    sort_by([platform_name, (.displayName // "" | ascii_downcase)])')
 
   # Build a fast lookup of selected ids: jq joins comma-separated.
   local selected_ids=""
@@ -840,10 +879,28 @@ picker_populate_for_alias() {
       *,"$id",*) PICK_SELECTED+=("1") ;;
       *)         PICK_SELECTED+=("0") ;;
     esac
-  done < <(printf '%s' "$sorted" | jq -r '.[] |
+  done < <(printf '%s' "$sorted" | jq -r '
+    def platform_name:
+      ((.url // "") | ascii_downcase) as $u |
+      if   ($u | test("youtube\\.com|youtu\\.be")) then "YouTube"
+      elif ($u | test("twitch\\.tv"))               then "Twitch"
+      elif ($u | test("kick\\.com"))                then "Kick"
+      elif ($u | test("rumble\\.com"))              then "Rumble"
+      elif ($u | test("facebook\\.com|fb\\.com"))   then "Facebook"
+      elif ($u | test("linkedin\\.com"))            then "LinkedIn"
+      elif ($u | test("mixcloud\\.com"))            then "Mixcloud"
+      elif ($u | test("dlive\\.tv"))                then "DLive"
+      elif ($u | test("trovo\\.live"))              then "Trovo"
+      elif ($u | test("tiktok\\.com"))              then "TikTok"
+      elif ($u | test("instagram\\.com"))           then "Instagram"
+      elif ($u | test("x\\.com|twitter\\.com"))     then "X"
+      elif ((.identifier // "") | startswith("dlive-")) then "DLive"
+      else "plat-" + ((.streamingPlatformId // .platformId // "?") | tostring)
+      end;
+    .[] |
     [(.id|tostring),
      (.displayName // "(unnamed)"),
-     ((.streamingPlatformId // .platformId // "")|tostring),
+     platform_name,
      ((if .enabled != null then .enabled elif .active != null then .active else false end) | tostring)] | @tsv')
 }
 
@@ -1203,7 +1260,7 @@ prompt_alias_choice() {
     echo "Type an existing alias to edit it, or a new name to create one." >&2
   else
     echo "No aliases yet. Pick a name for your first one." >&2
-    echo "Names: letters/digits/_/./- (e.g. 'wreathen', 'main', 'podcast.live')." >&2
+    echo "Names: letters/digits/_/./- (e.g. 'reeethan', '3000ad', 'podcast')." >&2
   fi
   printf 'Alias name (empty to abort): ' >&2
   local name
