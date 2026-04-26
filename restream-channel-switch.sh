@@ -1440,6 +1440,32 @@ Options:
   --reset-creds       Delete stored client credentials, tokens, last state, and alias map.
   --help, -h          Show this help.
 
+Quick-start (after --setup):
+  Just pass the alias name. That's the whole API — one command per scene.
+
+  restream-channel-switch --alias reeethan        # enable every channel tagged
+                                                  # "reeethan", disable the rest
+  restream-channel-switch --alias 3000ad          # swap to your other alias
+  restream-channel-switch --alias reeethan --dry-run
+                                                  # preview the toggle, no API
+                                                  # writes — useful for testing
+
+  restream-channel-switch --aliases               # list defined aliases + counts
+  restream-channel-switch --list                  # current per-channel state
+
+OBScene wiring:
+  In OBScene Settings → each TriggerProfile → "Run on activate" field, paste:
+
+    restream-channel-switch --alias reeethan
+
+  (or whichever alias matches the profile). Replace "reeethan" with your real
+  alias name; --dry-run is NOT recommended in production wiring.
+
+Editing aliases later:
+  --setup           re-run the full TUI; n to add new, d to delete current,
+                    Tab to cycle aliases, Space to (un)select channels.
+  --add-alias NAME  one-shot edit: opens picker for just NAME (creates if new).
+
 Exit codes:
   0 success, 1 auth error, 2 network/API error,
   3 alias didn't match any channels, 4 partial success,
