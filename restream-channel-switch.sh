@@ -133,6 +133,12 @@ EXIT_NO_MATCH=3
 EXIT_PARTIAL=4
 EXIT_NO_SETUP=5
 
+# After applying an alias, re-fetch Restream's channel list and verify the
+# actual active state. If Restream accepted only some PATCHes, re-apply just
+# the mismatched channels this many times before returning partial failure.
+VERIFY_RETRIES_DEFAULT=2
+VERIFY_SLEEP_SECONDS_DEFAULT=1
+
 # ---------------------------------------------------------------------------
 # Dependency check
 # ---------------------------------------------------------------------------
@@ -573,12 +579,24 @@ fetch_profile() {
 ENABLED_NAMES=()
 DISABLED_NAMES=()
 ERRORS_JSON="[]"
+VERIFY_MISMATCHES_JSON="[]"
+VERIFY_TO_ENABLE_JSON="[]"
+VERIFY_TO_DISABLE_JSON="[]"
 
-apply_toggles() {
+reset_toggle_results() {
   ENABLED_NAMES=()
   DISABLED_NAMES=()
   ERRORS_JSON="[]"
+}
 
+append_toggle_error() {
+  local name="$1" op="$2" status="$3"
+  ERRORS_JSON=$(printf '%s' "$ERRORS_JSON" | jq \
+    --arg n "$name" --arg op "$op" --arg s "$status" \
+    '. + [{channel:$n, op:$op, status:$s}]')
+}
+
+apply_toggles() {
   local id name
   while IFS=$'\t' read -r id name; do
     [[ -z "$id" ]] && continue
@@ -587,8 +605,7 @@ apply_toggles() {
       echo "  ok enabled  $name (id $id)"
     else
       echo "  FAIL enable $name (id $id): $API_STATUS $API_BODY" >&2
-      ERRORS_JSON=$(printf '%s' "$ERRORS_JSON" | jq --arg n "$name" --arg s "$API_STATUS" \
-        '. + [{channel:$n, op:"enable", status:$s}]')
+      append_toggle_error "$name" "enable" "$API_STATUS"
     fi
   done < <(printf '%s' "$1" | jq -r '.[] | "\(.id)\t\(.displayName)"')
 
@@ -599,10 +616,63 @@ apply_toggles() {
       echo "  ok disabled $name (id $id)"
     else
       echo "  FAIL disable $name (id $id): $API_STATUS $API_BODY" >&2
-      ERRORS_JSON=$(printf '%s' "$ERRORS_JSON" | jq --arg n "$name" --arg s "$API_STATUS" \
-        '. + [{channel:$n, op:"disable", status:$s}]')
+      append_toggle_error "$name" "disable" "$API_STATUS"
     fi
   done < <(printf '%s' "$2" | jq -r '.[] | "\(.id)\t\(.displayName)"')
+}
+
+positive_int_or_default() {
+  local value="$1" default="$2"
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$value"
+  else
+    printf '%s' "$default"
+  fi
+}
+
+compute_verify_mismatches_for_alias() {
+  local alias_name="$1" channels="$2" alias_map="$3"
+  VERIFY_MISMATCHES_JSON=$(jq -cn --arg a "$alias_name" --argjson m "$alias_map" --argjson ch "$channels" '
+    def live: if .enabled != null then .enabled elif .active != null then .active else false end;
+    ($m.channel_aliases // {}) as $ca
+    | [$ch[]
+      | ((($ca[(.id|tostring)] // []) | index($a)) != null) as $expected
+      | (live) as $actual
+      | select($actual != $expected)
+      | {id:(.id|tostring), displayName:(.displayName // (.id|tostring)), expectedActive:$expected, actualActive:$actual}]
+  ')
+  VERIFY_TO_ENABLE_JSON=$(printf '%s' "$VERIFY_MISMATCHES_JSON" | jq '[.[] | select(.expectedActive == true) | {id, displayName}]')
+  VERIFY_TO_DISABLE_JSON=$(printf '%s' "$VERIFY_MISMATCHES_JSON" | jq '[.[] | select(.expectedActive == false) | {id, displayName}]')
+}
+
+verify_alias_state() {
+  local alias_name="$1"
+  fetch_channels
+  compute_verify_mismatches_for_alias "$alias_name" "$CHANNELS_JSON" "$ALIAS_MAP_JSON"
+  local mismatch_count
+  mismatch_count=$(printf '%s' "$VERIFY_MISMATCHES_JSON" | jq 'length')
+  if (( mismatch_count == 0 )); then
+    echo "  verified: all channels match alias '$alias_name'"
+    return 0
+  fi
+
+  echo "  verify mismatch ($mismatch_count channel(s)):" >&2
+  printf '%s' "$VERIFY_MISMATCHES_JSON" | jq -r '
+    .[] | "    - \(.displayName) (id \(.id)): expected=\(if .expectedActive then "ON" else "off" end), actual=\(if .actualActive then "ON" else "off" end)"
+  ' >&2
+  return 1
+}
+
+record_verify_mismatches_as_errors() {
+  ERRORS_JSON=$(jq -cn --argjson existing "$ERRORS_JSON" --argjson mismatches "$VERIFY_MISMATCHES_JSON" '
+    $existing + ($mismatches | map({
+      channel:.displayName,
+      op:"verify",
+      status:"mismatch",
+      expectedActive:.expectedActive,
+      actualActive:.actualActive
+    }))
+  ')
 }
 
 # ---------------------------------------------------------------------------
@@ -732,31 +802,56 @@ EOF
     return "$EXIT_OK"
   fi
 
+  reset_toggle_results
   apply_toggles "$TO_ENABLE_JSON" "$TO_DISABLE_JSON"
+
+  local max_verify_retries verify_sleep verify_attempt verified
+  max_verify_retries=$(positive_int_or_default "${RESTREAM_VERIFY_RETRIES:-}" "$VERIFY_RETRIES_DEFAULT")
+  verify_sleep=$(positive_int_or_default "${RESTREAM_VERIFY_SLEEP_SECONDS:-}" "$VERIFY_SLEEP_SECONDS_DEFAULT")
+  verified="false"
+
+  echo
+  echo "Verifying Restream channel state..."
+  for (( verify_attempt=0; verify_attempt<=max_verify_retries; verify_attempt++ )); do
+    if verify_alias_state "$alias_name"; then
+      verified="true"
+      break
+    fi
+    if (( verify_attempt >= max_verify_retries )); then
+      break
+    fi
+    echo "  re-applying mismatched channels (retry $((verify_attempt + 1))/$max_verify_retries)..." >&2
+    apply_toggles "$VERIFY_TO_ENABLE_JSON" "$VERIFY_TO_DISABLE_JSON"
+    sleep "$verify_sleep"
+  done
+
+  if [[ "$verified" != "true" ]]; then
+    record_verify_mismatches_as_errors
+  fi
 
   local ts state_json
   ts=$(date "+%Y-%m-%dT%H:%M:%S%z")
   state_json=$(jq -cn \
-    --arg alias "$alias_name" --arg ts "$ts" \
+    --arg alias "$alias_name" --arg ts "$ts" --argjson verified "$verified" \
     --argjson enabled "$(printf '%s\n' "${ENABLED_NAMES[@]:-}" | jq -Rsc 'split("\n")|map(select(length>0))')" \
     --argjson disabled "$(printf '%s\n' "${DISABLED_NAMES[@]:-}" | jq -Rsc 'split("\n")|map(select(length>0))')" \
-    --argjson errors "$ERRORS_JSON" \
-    '{alias:$alias, ts:$ts, enabled:$enabled, disabled:$disabled, errors:$errors}')
+    --argjson errors "$ERRORS_JSON" --argjson mismatches "$VERIFY_MISMATCHES_JSON" \
+    '{alias:$alias, ts:$ts, verified:$verified, enabled:$enabled, disabled:$disabled, errors:$errors, mismatches:$mismatches}')
   save_last_state "$state_json"
 
   local err_count
   err_count=$(printf '%s' "$ERRORS_JSON" | jq 'length')
   local result="ok"
   (( err_count > 0 )) && result="partial"
-  log_event action alias alias "$alias_name" result "$result" errors "$err_count"
+  log_event action alias alias "$alias_name" result "$result" errors "$err_count" verified "$verified"
 
   if (( err_count > 0 )); then
     echo
-    echo "$err_count error(s) during toggle." >&2
+    echo "$err_count error(s) during toggle/verification." >&2
     return "$EXIT_PARTIAL"
   fi
   echo
-  echo "Alias '$alias_name' applied."
+  echo "Alias '$alias_name' applied and verified."
   return "$EXIT_OK"
 }
 
@@ -790,9 +885,14 @@ cmd_status() {
     printf '  alias:    %s\n' "$(printf '%s' "$last" | jq -r '.alias // .flag // .profile // ""')"
     printf '  enabled:  %s\n' "$(printf '%s' "$last" | jq -c '.enabled // []')"
     printf '  disabled: %s\n' "$(printf '%s' "$last" | jq -c '.disabled // []')"
-    local errs
+    if printf '%s' "$last" | jq -e 'has("verified")' >/dev/null 2>&1; then
+      printf '  verified: %s\n' "$(printf '%s' "$last" | jq -r '.verified')"
+    fi
+    local errs mismatches
     errs=$(printf '%s' "$last" | jq -c '.errors // []')
     [[ "$errs" != "[]" ]] && printf '  errors:   %s\n' "$errs"
+    mismatches=$(printf '%s' "$last" | jq -c '.mismatches // []')
+    [[ "$mismatches" != "[]" ]] && printf '  mismatches: %s\n' "$mismatches"
   else
     echo
     echo "No previous toggle recorded."

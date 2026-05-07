@@ -116,6 +116,8 @@ restream-channel-switch --reset-creds                # wipe all keychain entries
 restream-channel-switch --help
 ```
 
+After a real `--alias` run, the CLI now re-fetches Restream channel state, verifies that every alias channel is on and every non-alias channel is off, then re-applies only mismatched channels up to 2 times before returning exit code 4. Tune this with `RESTREAM_VERIFY_RETRIES` and `RESTREAM_VERIFY_SLEEP_SECONDS` if Restream is slow to settle.
+
 ## OBScene integration (intended use case)
 
 [OBScene](https://github.com/EthanSK/OBScene) exposes a per-profile "Run Script" field. Point it at this CLI with an `--alias` argument and OBScene will fire it on profile activation:
@@ -134,7 +136,7 @@ No daemons, no USB watchers, no launchd plists — OBScene handles the trigger; 
 | 1    | Auth error (tokens bad / expired / revoked — re-run `--auth`) |
 | 2    | Network / API error |
 | 3    | Alias matched zero channels (run `--setup` to assign some) |
-| 4    | Partial success — some channels toggled, some failed |
+| 4    | Partial success — some channels toggled, some failed, or final verification still mismatched after retries |
 | 5    | No alias mapping exists yet (run `--setup`) |
 
 ## Keychain entries
@@ -156,7 +158,7 @@ security find-generic-password -s com.restream-profile -a channel-aliases -w | j
 
 ## Logging
 
-Single-line JSON events per run at `~/Library/Logs/restream-channel-switch/toggle.log`. Rotates manually — when the file exceeds 10 MB it's renamed to `toggle.log.1`.
+Single-line JSON events per run at `~/Library/Logs/restream-channel-switch/toggle.log`. Rotates manually — when the file exceeds 10 MB it's renamed to `toggle.log.1`. The saved `last-state` keychain record includes `verified` plus any final `mismatches`, so failures clearly show which destinations did not reach the expected on/off state.
 
 ## Migrating from the "flags" era (v2.0 → v2.1)
 
