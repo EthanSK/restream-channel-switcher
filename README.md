@@ -122,17 +122,21 @@ After a real `--alias` run, the CLI now re-fetches Restream channel state, verif
 
 Token refresh and every API call are wrapped in a retry loop that retries on curl-level failures (DNS resolution, connection refused, TLS handshake) and on HTTP status `000` (no response). This matters when the script is fired by an OBScene USB-plug-in / display-attach trigger right after wake-from-sleep — the network stack is often still coming up at that exact moment, and a one-shot curl would silently fail with `Could not resolve host`, leaving the channel switch a no-op.
 
-Defaults: 4 retries, 2-second initial backoff (exponential — 2s, 4s, 8s, 16s), 15-second connect timeout. Tune via:
+Retries continue until either the API succeeds **or** total elapsed time exceeds `RESTREAM_NET_TOTAL_TIMEOUT_SECONDS` (default 1800s = 30 min). Useful for handling slow Wi-Fi recovery on USB plug-in / wake-from-sleep — the script will self-heal up to 30 minutes by default while the laptop reconnects to Wi-Fi.
+
+Defaults: backoff doubles each attempt (2s, 4s, 8s, 16s, 32s, 64s, 120s, 120s, …) capped at 120s per sleep, 15-second connect timeout, 30-minute total retry window. Tune via:
 
 | Env var | Default | Meaning |
 | --- | --- | --- |
-| `RESTREAM_NET_RETRIES`         | 4  | Number of retries beyond the initial attempt |
-| `RESTREAM_NET_SLEEP_SECONDS`   | 2  | Initial backoff in seconds (doubles each retry) |
-| `RESTREAM_NET_TIMEOUT_SECONDS` | 15 | curl `--connect-timeout` (max-time is 2x) |
+| `RESTREAM_NET_TOTAL_TIMEOUT_SECONDS` | 1800  | Upper bound on TOTAL elapsed retry time (seconds). 30 min by default; set higher/lower to widen/narrow the self-heal window. |
+| `RESTREAM_NET_BACKOFF_CAP_SECONDS`   | 120   | Cap on individual sleep durations. Prevents one giant 30-min sleep at the tail of a long retry run. |
+| `RESTREAM_NET_RETRIES`               | 10000 | Hard cap on attempt count (rarely the controlling factor; defaults to effectively unbounded so the total-timeout is the gate). Set lower if you want fast-fail behavior. |
+| `RESTREAM_NET_SLEEP_SECONDS`         | 2     | Initial backoff in seconds (doubles each retry, capped by `RESTREAM_NET_BACKOFF_CAP_SECONDS`). |
+| `RESTREAM_NET_TIMEOUT_SECONDS`       | 15    | curl `--connect-timeout` (max-time is 2x) |
 
 Auth errors (4xx) and server errors (5xx) are not retried by this layer; they're surfaced via the existing exit codes (1 / 2 / 4).
 
-Network failures are logged as structured NDJSON events (`net-retry-exhausted`, `api-net-fail`, `token-post-net-fail`) in `~/Library/Logs/restream-channel-switch/toggle.log`, so post-mortems on a silent USB-trigger run are straightforward.
+Network failures are logged as structured NDJSON events (`net-retry-attempt`, `net-retry-recovered`, `net-retry-exhausted`, `api-net-fail`, `token-post-net-fail`) in `~/Library/Logs/restream-channel-switch/toggle.log`, so post-mortems on a silent USB-trigger run are straightforward. Each `net-retry-attempt` record includes `elapsed_s` (seconds since the first attempt) and `sleep_s` (sleep duration before the next try) so you can reconstruct the full retry timeline.
 
 ## OBScene integration (intended use case)
 

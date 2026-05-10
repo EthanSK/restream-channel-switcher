@@ -143,16 +143,26 @@ VERIFY_SLEEP_SECONDS_DEFAULT=1
 # failure, connection refused, TLS hiccup). Especially relevant when
 # fired from a USB-plug-in / wake-from-sleep trigger where the network
 # stack may not be ready yet. Backoff is exponential: SLEEP_SECONDS,
-# 2*SLEEP_SECONDS, 4*SLEEP_SECONDS, ...
+# 2*SLEEP_SECONDS, 4*SLEEP_SECONDS, ... capped at BACKOFF_CAP_SECONDS so
+# individual sleeps don't balloon to multi-minute waits.
+#
+# Retries continue until EITHER the call succeeds, OR total elapsed time
+# since the first attempt exceeds NET_TOTAL_TIMEOUT_SECONDS, OR the
+# RESTREAM_NET_RETRIES cap is hit (whichever comes first). The total-
+# timeout default of 1800s (30 min) handles slow Wi-Fi recovery on USB
+# plug-in / wake-from-sleep — the script self-heals once the network
+# stack comes back, instead of failing fast at ~30s.
 #
 # These ONLY apply to network-level failures (curl exit non-zero, or
 # HTTP status "000"). Auth errors (4xx) and server errors (5xx) are NOT
 # retried by this layer — those are application-level and need their
 # own handling (e.g. /user/channel returning 401 triggers a refresh in
 # api_call, refresh token rotation is handled by save_tokens, etc.).
-NET_RETRIES_DEFAULT=4
+NET_RETRIES_DEFAULT=10000
 NET_SLEEP_SECONDS_DEFAULT=2
 NET_TIMEOUT_SECONDS_DEFAULT=15
+NET_TOTAL_TIMEOUT_SECONDS_DEFAULT=1800
+NET_BACKOFF_CAP_SECONDS_DEFAULT=120
 
 # ---------------------------------------------------------------------------
 # Dependency check
@@ -490,35 +500,57 @@ do_auth_flow() {
 #     helper — see _token_post which only invokes us for the curl portion).
 #
 # Public globals consumed:
-#   RESTREAM_NET_RETRIES         — override NET_RETRIES_DEFAULT
-#   RESTREAM_NET_SLEEP_SECONDS   — override NET_SLEEP_SECONDS_DEFAULT
+#   RESTREAM_NET_RETRIES              — override NET_RETRIES_DEFAULT
+#                                       (hard cap on attempt count; default
+#                                       is effectively unbounded so the
+#                                       total-timeout is the gate)
+#   RESTREAM_NET_SLEEP_SECONDS        — override NET_SLEEP_SECONDS_DEFAULT
+#                                       (initial backoff seconds)
+#   RESTREAM_NET_TOTAL_TIMEOUT_SECONDS — override NET_TOTAL_TIMEOUT_SECONDS_DEFAULT
+#                                       (upper bound on TOTAL elapsed retry time)
+#   RESTREAM_NET_BACKOFF_CAP_SECONDS  — override NET_BACKOFF_CAP_SECONDS_DEFAULT
+#                                       (cap on individual sleep durations)
 NET_LAST_ATTEMPTS=0
 with_net_retry() {
   local label="$1"
   shift
-  local max_retries sleep_seconds attempt rc
+  local max_retries sleep_seconds total_timeout backoff_cap attempt rc
   max_retries=$(positive_int_or_default "${RESTREAM_NET_RETRIES:-}" "$NET_RETRIES_DEFAULT")
   sleep_seconds=$(positive_int_or_default "${RESTREAM_NET_SLEEP_SECONDS:-}" "$NET_SLEEP_SECONDS_DEFAULT")
+  total_timeout=$(positive_int_or_default "${RESTREAM_NET_TOTAL_TIMEOUT_SECONDS:-}" "$NET_TOTAL_TIMEOUT_SECONDS_DEFAULT")
+  backoff_cap=$(positive_int_or_default "${RESTREAM_NET_BACKOFF_CAP_SECONDS:-}" "$NET_BACKOFF_CAP_SECONDS_DEFAULT")
   NET_LAST_ATTEMPTS=0
 
-  local backoff="$sleep_seconds"
+  local start now elapsed backoff sleep_for
+  start=$(date +%s)
   for (( attempt=0; attempt<=max_retries; attempt++ )); do
     NET_LAST_ATTEMPTS=$((attempt + 1))
     "$@"
     rc=$?
+    now=$(date +%s)
+    elapsed=$(( now - start ))
     if (( rc == 0 )); then
       if (( attempt > 0 )); then
-        log_event action net-retry-recovered label "$label" attempts "$NET_LAST_ATTEMPTS"
+        log_event action net-retry-recovered label "$label" attempts "$NET_LAST_ATTEMPTS" elapsed_s "$elapsed"
       fi
       return 0
     fi
-    if (( attempt >= max_retries )); then
-      log_event action net-retry-exhausted label "$label" attempts "$NET_LAST_ATTEMPTS"
+    # Compute next backoff: 2^attempt * sleep_seconds, capped.
+    backoff=$(( sleep_seconds * (1 << attempt) ))
+    if (( backoff > backoff_cap )); then
+      backoff="$backoff_cap"
+    fi
+    sleep_for="$backoff"
+    # Stop if we've exhausted the attempt cap, or the next sleep would
+    # push us past the total timeout. Sleeping right up to the cap is
+    # fine; sleeping past it just wastes wall time.
+    if (( attempt >= max_retries )) || (( elapsed + sleep_for >= total_timeout )); then
+      log_event action net-retry-exhausted label "$label" attempts "$NET_LAST_ATTEMPTS" elapsed_s "$elapsed" total_timeout_s "$total_timeout"
       return "$rc"
     fi
-    echo "  network failure for $label (attempt $((attempt + 1))/$((max_retries + 1))); retrying in ${backoff}s..." >&2
-    sleep "$backoff"
-    backoff=$(( backoff * 2 ))
+    log_event action net-retry-attempt label "$label" attempt "$NET_LAST_ATTEMPTS" elapsed_s "$elapsed" sleep_s "$sleep_for"
+    echo "  network failure for $label (attempt $NET_LAST_ATTEMPTS, elapsed ${elapsed}s/${total_timeout}s); retrying in ${sleep_for}s..." >&2
+    sleep "$sleep_for"
   done
   return 1
 }
