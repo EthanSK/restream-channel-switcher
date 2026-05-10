@@ -118,6 +118,22 @@ restream-channel-switch --help
 
 After a real `--alias` run, the CLI now re-fetches Restream channel state, verifies that every alias channel is on and every non-alias channel is off, then re-applies only mismatched channels up to 2 times before returning exit code 4. Tune this with `RESTREAM_VERIFY_RETRIES` and `RESTREAM_VERIFY_SLEEP_SECONDS` if Restream is slow to settle.
 
+### Network retry on transient failures
+
+Token refresh and every API call are wrapped in a retry loop that retries on curl-level failures (DNS resolution, connection refused, TLS handshake) and on HTTP status `000` (no response). This matters when the script is fired by an OBScene USB-plug-in / display-attach trigger right after wake-from-sleep — the network stack is often still coming up at that exact moment, and a one-shot curl would silently fail with `Could not resolve host`, leaving the channel switch a no-op.
+
+Defaults: 4 retries, 2-second initial backoff (exponential — 2s, 4s, 8s, 16s), 15-second connect timeout. Tune via:
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `RESTREAM_NET_RETRIES`         | 4  | Number of retries beyond the initial attempt |
+| `RESTREAM_NET_SLEEP_SECONDS`   | 2  | Initial backoff in seconds (doubles each retry) |
+| `RESTREAM_NET_TIMEOUT_SECONDS` | 15 | curl `--connect-timeout` (max-time is 2x) |
+
+Auth errors (4xx) and server errors (5xx) are not retried by this layer; they're surfaced via the existing exit codes (1 / 2 / 4).
+
+Network failures are logged as structured NDJSON events (`net-retry-exhausted`, `api-net-fail`, `token-post-net-fail`) in `~/Library/Logs/restream-channel-switch/toggle.log`, so post-mortems on a silent USB-trigger run are straightforward.
+
 ## OBScene integration (intended use case)
 
 [OBScene](https://github.com/EthanSK/OBScene) exposes a per-profile "Run Script" field. Point it at this CLI with an `--alias` argument and OBScene will fire it on profile activation:
@@ -159,6 +175,19 @@ security find-generic-password -s com.restream-profile -a channel-aliases -w | j
 ## Logging
 
 Single-line JSON events per run at `~/Library/Logs/restream-channel-switch/toggle.log`. Rotates manually — when the file exceeds 10 MB it's renamed to `toggle.log.1`. The saved `last-state` keychain record includes `verified` plus any final `mismatches`, so failures clearly show which destinations did not reach the expected on/off state.
+
+Notable event types:
+
+- `alias` — alias applied (`result: ok|partial`, `verified: true|false`)
+- `refresh` — token refresh (`result: ok|fail`)
+- `api-error` — API call returned a non-2xx final status after retries
+- `net-retry-recovered` — a transient network failure recovered after one or more retries (`attempts: N`)
+- `net-retry-exhausted` — a network failure exhausted all retries (`attempts: N`)
+- `api-net-fail` — API call failed at the network layer after retries (`method`, `path`, `attempts`, `curl_exit`, `status`)
+- `token-post-net-fail` — token endpoint failed at the network layer after retries
+- `token-post-http-fail` — token endpoint returned a non-2xx HTTP status
+
+When debugging a silent USB-trigger no-op, grep for `api-net-fail` / `token-post-net-fail` first.
 
 ## Migrating from the "flags" era (v2.0 → v2.1)
 

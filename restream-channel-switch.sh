@@ -139,6 +139,21 @@ EXIT_NO_SETUP=5
 VERIFY_RETRIES_DEFAULT=2
 VERIFY_SLEEP_SECONDS_DEFAULT=1
 
+# Network-level retry for transient connection failures (DNS resolution
+# failure, connection refused, TLS hiccup). Especially relevant when
+# fired from a USB-plug-in / wake-from-sleep trigger where the network
+# stack may not be ready yet. Backoff is exponential: SLEEP_SECONDS,
+# 2*SLEEP_SECONDS, 4*SLEEP_SECONDS, ...
+#
+# These ONLY apply to network-level failures (curl exit non-zero, or
+# HTTP status "000"). Auth errors (4xx) and server errors (5xx) are NOT
+# retried by this layer — those are application-level and need their
+# own handling (e.g. /user/channel returning 401 triggers a refresh in
+# api_call, refresh token rotation is handled by save_tokens, etc.).
+NET_RETRIES_DEFAULT=4
+NET_SLEEP_SECONDS_DEFAULT=2
+NET_TIMEOUT_SECONDS_DEFAULT=15
+
 # ---------------------------------------------------------------------------
 # Dependency check
 # ---------------------------------------------------------------------------
@@ -452,27 +467,117 @@ do_auth_flow() {
 }
 
 # ---------------------------------------------------------------------------
+# Network retry helper
+# ---------------------------------------------------------------------------
+# Run a curl-based command with retry on network-level failures (DNS
+# resolution failure, connection refused, TLS handshake, etc. — anything
+# that produces a non-zero curl exit OR an HTTP status of "000").
+#
+# This is critical when the script is fired by an OBScene USB-plug-in /
+# display-attach trigger right after wake-from-sleep — the network stack
+# is often still coming up at that exact moment, and a one-shot curl
+# silently fails with "Could not resolve host" (status code 000), causing
+# the whole channel-switch to no-op while looking like it succeeded.
+# (Pre-2026-05-10 silent-failure mode.)
+#
+# Caller passes the curl invocation as a function name + args. The function
+# is expected to:
+#   - on success: set status/body globals (or whatever its contract is) and
+#     return 0.
+#   - on transient network failure: print to stderr and return 1.
+#   - on auth/app failure: return 1 (we cannot distinguish here, so the
+#     caller is responsible for not retrying app-level errors via this
+#     helper — see _token_post which only invokes us for the curl portion).
+#
+# Public globals consumed:
+#   RESTREAM_NET_RETRIES         — override NET_RETRIES_DEFAULT
+#   RESTREAM_NET_SLEEP_SECONDS   — override NET_SLEEP_SECONDS_DEFAULT
+NET_LAST_ATTEMPTS=0
+with_net_retry() {
+  local label="$1"
+  shift
+  local max_retries sleep_seconds attempt rc
+  max_retries=$(positive_int_or_default "${RESTREAM_NET_RETRIES:-}" "$NET_RETRIES_DEFAULT")
+  sleep_seconds=$(positive_int_or_default "${RESTREAM_NET_SLEEP_SECONDS:-}" "$NET_SLEEP_SECONDS_DEFAULT")
+  NET_LAST_ATTEMPTS=0
+
+  local backoff="$sleep_seconds"
+  for (( attempt=0; attempt<=max_retries; attempt++ )); do
+    NET_LAST_ATTEMPTS=$((attempt + 1))
+    "$@"
+    rc=$?
+    if (( rc == 0 )); then
+      if (( attempt > 0 )); then
+        log_event action net-retry-recovered label "$label" attempts "$NET_LAST_ATTEMPTS"
+      fi
+      return 0
+    fi
+    if (( attempt >= max_retries )); then
+      log_event action net-retry-exhausted label "$label" attempts "$NET_LAST_ATTEMPTS"
+      return "$rc"
+    fi
+    echo "  network failure for $label (attempt $((attempt + 1))/$((max_retries + 1))); retrying in ${backoff}s..." >&2
+    sleep "$backoff"
+    backoff=$(( backoff * 2 ))
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # Token exchange / refresh
 # ---------------------------------------------------------------------------
-_token_post() {
-  local resp status body
-  resp=$(curl -sS -w $'\n%{http_code}' -u "${CLIENT_ID}:${CLIENT_SECRET}" \
+TOKEN_POST_STATUS=0
+TOKEN_POST_BODY=""
+TOKEN_POST_CURL_EXIT=0
+
+# Inner curl call for _token_post. Sets TOKEN_POST_* globals.
+# Returns:
+#   0 — got an HTTP response, even a non-2xx one (auth error, etc.)
+#   1 — transient network failure (curl non-zero, or HTTP "000" / no response)
+_token_post_curl() {
+  local timeout_seconds
+  timeout_seconds=$(positive_int_or_default "${RESTREAM_NET_TIMEOUT_SECONDS:-}" "$NET_TIMEOUT_SECONDS_DEFAULT")
+  local resp curl_exit
+  resp=$(curl -sS -w $'\n%{http_code}' \
+    --connect-timeout "$timeout_seconds" \
+    --max-time $(( timeout_seconds * 2 )) \
+    -u "${CLIENT_ID}:${CLIENT_SECRET}" \
     -H "User-Agent: $USER_AGENT" \
     -H "Content-Type: application/x-www-form-urlencoded" \
-    "$@" \
-    "$TOKEN_URL")
-  status="${resp##*$'\n'}"
-  body="${resp%$'\n'*}"
-  if [[ "$status" != "200" ]]; then
-    echo "token request failed ($status): $body" >&2
+    "${_TOKEN_POST_ARGS[@]}" \
+    "$TOKEN_URL" 2>&1)
+  curl_exit=$?
+  TOKEN_POST_CURL_EXIT="$curl_exit"
+  TOKEN_POST_STATUS="${resp##*$'\n'}"
+  TOKEN_POST_BODY="${resp%$'\n'*}"
+  if (( curl_exit != 0 )) || [[ "$TOKEN_POST_STATUS" == "000" ]]; then
+    echo "token request: curl exit=$curl_exit status=$TOKEN_POST_STATUS body=$TOKEN_POST_BODY" >&2
+    return 1
+  fi
+  return 0
+}
+
+_token_post() {
+  # Capture caller-supplied curl args into a global so the inner curl
+  # function (invoked via with_net_retry) can see them — bash doesn't
+  # let us pass arrays through "$@" composition cleanly here.
+  _TOKEN_POST_ARGS=("$@")
+  if ! with_net_retry token_post _token_post_curl; then
+    log_event action token-post-net-fail attempts "$NET_LAST_ATTEMPTS" curl_exit "$TOKEN_POST_CURL_EXIT" status "$TOKEN_POST_STATUS"
+    echo "token request failed after $NET_LAST_ATTEMPTS attempt(s) (curl exit $TOKEN_POST_CURL_EXIT)." >&2
+    return 1
+  fi
+  if [[ "$TOKEN_POST_STATUS" != "200" ]]; then
+    echo "token request failed ($TOKEN_POST_STATUS): $TOKEN_POST_BODY" >&2
+    log_event action token-post-http-fail status "$TOKEN_POST_STATUS"
     return 1
   fi
   local access refresh expires_in now expires_at
-  access=$(printf '%s' "$body" | jq -r '.access_token // .accessToken // empty')
-  refresh=$(printf '%s' "$body" | jq -r '.refresh_token // .refreshToken // empty')
-  expires_in=$(printf '%s' "$body" | jq -r '.expires_in // .accessTokenExpiresIn // 3600')
+  access=$(printf '%s' "$TOKEN_POST_BODY" | jq -r '.access_token // .accessToken // empty')
+  refresh=$(printf '%s' "$TOKEN_POST_BODY" | jq -r '.refresh_token // .refreshToken // empty')
+  expires_in=$(printf '%s' "$TOKEN_POST_BODY" | jq -r '.expires_in // .accessTokenExpiresIn // 3600')
   if [[ -z "$access" || -z "$refresh" ]]; then
-    echo "token response missing fields: $body" >&2
+    echo "token response missing fields: $TOKEN_POST_BODY" >&2
     return 1
   fi
   now=$(date +%s)
@@ -520,21 +625,51 @@ ensure_valid_tokens() {
 API_STATUS=0
 API_BODY=""
 
+_API_CALL_ARGS=()
+_API_CALL_PATH=""
+API_CALL_CURL_EXIT=0
+
+# Inner curl call for api_call. Sets API_STATUS / API_BODY / API_CALL_CURL_EXIT.
+# Returns:
+#   0 — got an HTTP response (any status), so the caller can branch on it
+#   1 — transient network failure (curl non-zero, or HTTP "000" / no response)
+_api_call_curl() {
+  local resp curl_exit
+  resp=$(curl "${_API_CALL_ARGS[@]}" "${API_BASE}${_API_CALL_PATH}" 2>&1)
+  curl_exit=$?
+  API_CALL_CURL_EXIT="$curl_exit"
+  API_STATUS="${resp##*$'\n'}"
+  API_BODY="${resp%$'\n'*}"
+  if (( curl_exit != 0 )) || [[ "$API_STATUS" == "000" ]]; then
+    echo "api_call $_API_CALL_PATH: curl exit=$curl_exit status=$API_STATUS" >&2
+    return 1
+  fi
+  return 0
+}
+
 api_call() {
   local method="$1" path="$2" body="${3-}"
   local retried=0
+  local timeout_seconds
+  timeout_seconds=$(positive_int_or_default "${RESTREAM_NET_TIMEOUT_SECONDS:-}" "$NET_TIMEOUT_SECONDS_DEFAULT")
   while :; do
-    local args=(-sS -X "$method" -w $'\n%{http_code}' \
+    _API_CALL_ARGS=(-sS -X "$method" -w $'\n%{http_code}' \
+      --connect-timeout "$timeout_seconds" \
+      --max-time $(( timeout_seconds * 2 )) \
       -H "Authorization: Bearer $ACCESS_TOKEN" \
       -H "User-Agent: $USER_AGENT" \
       -H "Accept: application/json")
     if [[ -n "$body" ]]; then
-      args+=(-H "Content-Type: application/json" --data "$body")
+      _API_CALL_ARGS+=(-H "Content-Type: application/json" --data "$body")
     fi
-    local resp
-    resp=$(curl "${args[@]}" "${API_BASE}${path}")
-    API_STATUS="${resp##*$'\n'}"
-    API_BODY="${resp%$'\n'*}"
+    _API_CALL_PATH="$path"
+    if ! with_net_retry "api_call $method $path" _api_call_curl; then
+      log_event action api-net-fail method "$method" path "$path" attempts "$NET_LAST_ATTEMPTS" curl_exit "$API_CALL_CURL_EXIT" status "$API_STATUS"
+      echo "API call $method $path failed after $NET_LAST_ATTEMPTS attempt(s) (curl exit $API_CALL_CURL_EXIT)." >&2
+      # Surface as 000 so caller's status-code check still works.
+      API_STATUS="000"
+      return 0
+    fi
     if [[ "$API_STATUS" == "401" && $retried -eq 0 ]]; then
       retried=1
       if refresh_access_token; then
