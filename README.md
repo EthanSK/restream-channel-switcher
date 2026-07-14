@@ -25,8 +25,10 @@ Channel-name substring matching looks tempting but breaks the moment you have mo
 ```bash
 git clone https://github.com/EthanSK/restream-channel-switcher.git ~/Projects/restream-channel-switcher
 chmod +x ~/Projects/restream-channel-switcher/restream-channel-switch.sh
+chmod +x ~/Projects/restream-channel-switcher/restore-obs-browser-docks.sh
 mkdir -p ~/.local/bin
 ln -s ~/Projects/restream-channel-switcher/restream-channel-switch.sh ~/.local/bin/restream-channel-switch
+ln -s ~/Projects/restream-channel-switcher/restore-obs-browser-docks.sh ~/.local/bin/restore-obs-browser-docks
 # Optional compat alias for anyone upgrading from v1:
 ln -s ~/.local/bin/restream-channel-switch ~/.local/bin/restream-profile
 ```
@@ -148,6 +150,16 @@ Network failures are logged as structured NDJSON events (`net-retry-attempt`, `n
 
 No daemons, no USB watchers, no launchd plists — OBScene handles the trigger; this script handles the API call. That's the whole loop.
 
+To restore only the `set channels` and `chat` OBS Custom Browser Docks after a successful Restream switch, append the separate dock command with `&&`:
+
+```
+/Users/you/.local/bin/restream-channel-switch --alias reeethan && /Users/you/.local/bin/restore-obs-browser-docks
+```
+
+With no arguments, `restore-obs-browser-docks` restores only the `set channels` and `chat` docks. Pass explicit titles to reuse it elsewhere, for example `restore-obs-browser-docks "Twitch Chat" "Stream Info"`. The command invokes each hidden dock's Accessibility `AXPress` action while the Docks menu remains closed. It does not steal focus or send keyboard input, skips overlapping invocations through a cross-process lock, and never retries a failed press. The launching app (for example OBScene or Terminal) must be allowed under **System Settings → Privacy & Security → Accessibility**.
+
+The implementation and recovery evidence are preserved in [`LEARNINGS.md`](LEARNINGS.md).
+
 ## Exit codes
 
 | Code | Meaning |
@@ -192,6 +204,8 @@ Notable event types:
 - `token-post-http-fail` — token endpoint returned a non-2xx HTTP status
 
 When debugging a silent USB-trigger no-op, grep for `api-net-fail` / `token-post-net-fail` first.
+
+The standalone OBS dock command writes daily structured diagnostics to `~/Library/Logs/restore-obs-browser-docks/` and deletes files older than approximately seven days on its next invocation.
 
 ## Migrating from the "flags" era (v2.0 → v2.1)
 
